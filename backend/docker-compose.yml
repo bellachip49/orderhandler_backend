@@ -6,3 +6,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: ${PORT:-8080}
+      DB_PATH: /data/orders.db
+    volumes:
+      - orders-data:/data
+
+volumes:
+  orders-data:

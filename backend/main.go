@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,15 +12,24 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
+	_ "modernc.org/sqlite"
 	_ "time/tzdata"
 )
 
 const defaultPort = 8080
-const defaultHost = "127.0.0.1"
+const defaultHost = "0.0.0.0"
+const defaultDBPath = "orders.db"
+
+const createOrdersTableSQL = `
+CREATE TABLE IF NOT EXISTS orders (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	created_at TEXT NOT NULL,
+	items      TEXT NOT NULL,
+	total      REAL NOT NULL
+)`
 
 // Orders are always timestamped in Pacific time, independent of the host or
 // container's local timezone. The blank "time/tzdata" import embeds the IANA
@@ -39,9 +49,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	db, err := openDatabase(dbPathFromEnvironment())
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
 	server := &http.Server{
 		Addr:              hostFromEnvironment() + ":" + strconv.Itoa(port),
-		Handler:           loggingMiddleware(newHandler()),
+		Handler:           loggingMiddleware(newHandler(db)),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -93,8 +109,28 @@ func hostFromEnvironment() string {
 	return value
 }
 
-func newHandler() http.Handler {
-	store := &orderStore{orders: make([]Order, 0)}
+func dbPathFromEnvironment() string {
+	value := os.Getenv("DB_PATH")
+	if value == "" {
+		return defaultDBPath
+	}
+	return value
+}
+
+func openDatabase(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(createOrdersTableSQL); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func newHandler(db *sql.DB) http.Handler {
+	store := &orderStore{db: db}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/health" {
@@ -116,7 +152,12 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 func ordersHandler(w http.ResponseWriter, r *http.Request, store *orderStore) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, store.all())
+		orders, err := store.all()
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, orders)
 	case http.MethodPost:
 		createOrderHandler(w, r, store)
 	default:
@@ -144,12 +185,21 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request, store *orderStor
 		return
 	}
 
-	createdOrder := store.add(order)
+	createdOrder, err := store.add(order)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusCreated, createdOrder)
 }
 
 func badRequest(w http.ResponseWriter, message string) {
 	writeJSON(w, http.StatusBadRequest, map[string]string{"error": message})
+}
+
+func internalError(w http.ResponseWriter, err error) {
+	log.Printf("internal error: %v", err)
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 }
 
 func notFoundHandler(w http.ResponseWriter, _ *http.Request) {
@@ -191,29 +241,61 @@ func (o Order) validate() error {
 }
 
 type orderStore struct {
-	mu     sync.RWMutex
-	nextID int64
-	orders []Order
+	db *sql.DB
 }
 
-func (s *orderStore) add(order Order) Order {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.nextID++
-	order.ID = s.nextID
+func (s *orderStore) add(order Order) (Order, error) {
+	itemsJSON, err := json.Marshal(order.Items)
+	if err != nil {
+		return Order{}, err
+	}
 	order.CreatedAt = time.Now().In(pacificLocation)
-	s.orders = append(s.orders, order)
-	return order
+
+	result, err := s.db.Exec(
+		"INSERT INTO orders (created_at, items, total) VALUES (?, ?, ?)",
+		order.CreatedAt.Format(time.RFC3339), string(itemsJSON), order.Total,
+	)
+	if err != nil {
+		return Order{}, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return Order{}, err
+	}
+	order.ID = id
+	return order, nil
 }
 
-func (s *orderStore) all() []Order {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *orderStore) all() ([]Order, error) {
+	rows, err := s.db.Query("SELECT id, created_at, items, total FROM orders ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 
-	orders := make([]Order, len(s.orders))
-	copy(orders, s.orders)
-	return orders
+	orders := make([]Order, 0)
+	for rows.Next() {
+		var (
+			order     Order
+			createdAt string
+			itemsJSON string
+		)
+		if err := rows.Scan(&order.ID, &createdAt, &itemsJSON, &order.Total); err != nil {
+			return nil, err
+		}
+		order.CreatedAt, err = time.Parse(time.RFC3339, createdAt)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(itemsJSON), &order.Items); err != nil {
+			return nil, err
+		}
+		orders = append(orders, order)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return orders, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

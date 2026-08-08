@@ -5,7 +5,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /out/orders_backend .
 
 FROM alpine:latest
-RUN adduser -D -H orders_backend
+RUN adduser -D -H orders_backend && mkdir /data && chown orders_backend /data
 COPY --from=build /out/orders_backend /orders_backend
 USER orders_backend
 ENV HOST=0.0.0.0

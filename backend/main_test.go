@@ -8,11 +8,23 @@ import (
 	"testing"
 )
 
+func newTestHandler(t *testing.T) http.Handler {
+	t.Helper()
+
+	db, err := openDatabase(":memory:")
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	return newHandler(db)
+}
+
 func TestHealthEndpoint(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/health", nil)
 	response := httptest.NewRecorder()
 
-	newHandler().ServeHTTP(response, request)
+	newTestHandler(t).ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
@@ -34,7 +46,7 @@ func TestUnknownRouteReturnsJSONNotFound(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/unknown", nil)
 	response := httptest.NewRecorder()
 
-	newHandler().ServeHTTP(response, request)
+	newTestHandler(t).ServeHTTP(response, request)
 
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
@@ -56,7 +68,7 @@ func TestOrdersEndpointReturnsEmptyCollection(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/orders", nil)
 	response := httptest.NewRecorder()
 
-	newHandler().ServeHTTP(response, request)
+	newTestHandler(t).ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
@@ -75,7 +87,7 @@ func TestOrdersEndpointReturnsEmptyCollection(t *testing.T) {
 }
 
 func TestCreateOrderAndListOrders(t *testing.T) {
-	handler := newHandler()
+	handler := newTestHandler(t)
 	body := []byte(`{
         "items": [
             {"name": "Milk Tea", "price": 4.5, "quantity": 2},
@@ -119,7 +131,7 @@ func TestCreateOrderAndListOrders(t *testing.T) {
 }
 
 func TestCreateOrderAssignsIncrementingIDs(t *testing.T) {
-	handler := newHandler()
+	handler := newTestHandler(t)
 	body := []byte(`{"items": [{"name": "Fish balls", "price": 5, "quantity": 1}], "total": 5}`)
 
 	for wantID := int64(1); wantID <= 2; wantID++ {
@@ -141,7 +153,7 @@ func TestCreateOrderRejectsInvalidPayload(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/orders", bytes.NewBufferString(`{"items": [], "total": 0}`))
 	response := httptest.NewRecorder()
 
-	newHandler().ServeHTTP(response, request)
+	newTestHandler(t).ServeHTTP(response, request)
 
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
@@ -152,7 +164,7 @@ func TestOrdersEndpointRejectsUnsupportedMethod(t *testing.T) {
 	request := httptest.NewRequest(http.MethodDelete, "/orders", nil)
 	response := httptest.NewRecorder()
 
-	newHandler().ServeHTTP(response, request)
+	newTestHandler(t).ServeHTTP(response, request)
 
 	if response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusMethodNotAllowed)
