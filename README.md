@@ -1,6 +1,6 @@
 # OrderBackend
 
-A local Go HTTP service for the ReceiptPrinterApp project. This initial version is independent of the iOS app and provides health and order endpoints, with orders persisted to a local SQLite database.
+A local Go HTTP service for the ReceiptPrinterApp project. The backend owns sale items, printer configuration, order persistence, order-number generation, and per-printer print job tracking.
 
 ## Prerequisite
 
@@ -38,7 +38,7 @@ Then from the other device:
 curl http://<mac-lan-ip>:8080/health
 ```
 
-The first time this happens, macOS may show a firewall prompt ("Do you want the incoming network connections to be allowed?") — allow it. Note that the server has no authentication, so anyone on the same network can reach these endpoints while it's running. To restrict it back to this Mac only, set `HOST=127.0.0.1`:
+The first time this happens, macOS may show a firewall prompt ("Do you want the incoming network connections to be allowed?") - allow it. API endpoints require HTTP Basic Auth. To restrict the server back to this Mac only, set `HOST=127.0.0.1`:
 
 ```sh
 HOST=127.0.0.1 go run .
@@ -47,25 +47,36 @@ HOST=127.0.0.1 go run .
 ## Endpoints
 
 - `GET /health` returns `{"status":"ok"}`.
-- `GET /orders` returns a JSON array of all orders created since the server started.
-- `POST /orders` accepts an order, assigns it an incrementing numerical `id` and a `created_at` timestamp in Pacific time (`America/Los_Angeles`, hardcoded regardless of the host or container's local timezone), and returns it with HTTP 201. Orders are persisted to a local SQLite database, so they survive server restarts.
-- Other methods on `/orders` return HTTP 405 with `Allow: GET, POST`.
+- `GET /api/v1/catalog` returns only active sale items for the iPad ordering screen.
+- `GET /api/v1/sale-items` lists all sale items, including inactive items.
+- `POST /api/v1/sale-items` creates a sale item using `name`, `price_cents`, and `active`.
+- `PUT /api/v1/sale-items/{id}` updates a sale item.
+- `DELETE /api/v1/sale-items/{id}` marks a sale item inactive.
+- `GET /api/v1/printers` lists cashier and kitchen printer configuration.
+- `GET /api/v1/printers/{cashier|kitchen}` loads one printer configuration.
+- `PUT /api/v1/printers/{cashier|kitchen}` saves `host`, `port`, and `enabled`.
+- `GET /api/v1/orders` lists saved orders with item snapshots and print jobs.
+- `GET /api/v1/orders/{id}` loads one saved order.
+- `POST /api/v1/orders` accepts sale item IDs and quantities, saves the order, assigns a readable `order_number`, creates cashier and kitchen print jobs, and returns the saved order with HTTP 201.
+- Legacy `GET /orders` and `POST /orders` remain temporarily available for older clients.
+
+All endpoints except `/health` require HTTP Basic Auth. Configure credentials with `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD`; defaults are `admin` and `orderbackend`.
 
 Create an order using the menu items from ReceiptPrinterApp:
 
 ```sh
-curl --request POST http://127.0.0.1:8080/orders \
+curl --user admin:orderbackend \
+  --request POST http://127.0.0.1:8080/api/v1/orders \
   --header 'Content-Type: application/json' \
   --data '{
     "items": [
-      {"name": "Milk Tea", "price": 4.50, "quantity": 2},
-      {"name": "Dumplings", "price": 6.00, "quantity": 1}
-    ],
-    "total": 15.00
+      {"sale_item_id": 4, "quantity": 2},
+      {"sale_item_id": 1, "quantity": 1}
+    ]
   }'
 ```
 
-Each order must have at least one item; each item needs a name, non-negative price, and quantity of at least one. The total must not be negative.
+Each order must have at least one active catalog item, and each item needs a quantity of at least one. Order item names and prices are snapshotted from the backend catalog at checkout time.
 
 To use a different port, set `PORT` when starting the service:
 
@@ -118,6 +129,16 @@ From the `backend` directory, build and start the service:
 docker compose up --build
 ```
 
+From the repo root, you can use Make instead:
+
+```sh
+make local-up
+```
+
+This starts the backend and stores SQLite at `/data/orders.db` inside the `orders-data` Docker volume. The default host port is `8080`.
+It also starts Swagger UI at `http://127.0.0.1:8088`, backed by `backend/openapi.yaml`.
+The Compose stack defaults to `admin` / `orderbackend` for Basic Auth. Override those with `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD`.
+
 Verify it the same way as a local run:
 
 ```sh
@@ -126,10 +147,156 @@ curl http://127.0.0.1:8080/health
 
 Stop it with `Ctrl-C`, or `docker compose down` if it was started detached (`-d`). The SQLite database is stored in the `orders-data` named volume (mounted at `/data`), so orders persist across `docker compose down`/`up` as long as the volume isn't removed (`docker compose down -v` deletes it).
 
-To use a different port, set `PORT` before starting; it is used for both the host mapping and the container's internal port:
+From the repo root:
 
 ```sh
-PORT=8081 docker compose up --build
+make local-down
+```
+
+To use a different host port for the Compose stack, set `APP_PORT` before starting:
+
+```sh
+APP_PORT=8081 docker compose up --build
+```
+
+To use a different Swagger UI host port, set `SWAGGER_PORT`:
+
+```sh
+SWAGGER_PORT=8090 docker compose up --build
+```
+
+From the repo root, print the OpenAPI file path and Swagger UI URL:
+
+```sh
+make openapi
+```
+
+Reset the local test database by deleting the named volume:
+
+```sh
+docker compose down -v
+```
+
+From the repo root:
+
+```sh
+make local-destroy
+```
+
+## Curl local test examples
+
+Set a base URL once:
+
+```sh
+BASE_URL=http://127.0.0.1:8080
+AUTH=admin:orderbackend
+```
+
+Health check:
+
+```sh
+curl "$BASE_URL/health"
+```
+
+List active catalog items for the ordering screen:
+
+```sh
+curl --user "$AUTH" "$BASE_URL/api/v1/catalog"
+```
+
+List all sale items, including inactive items:
+
+```sh
+curl --user "$AUTH" "$BASE_URL/api/v1/sale-items"
+```
+
+Create a sale item:
+
+```sh
+curl --user "$AUTH" \
+  --request POST "$BASE_URL/api/v1/sale-items" \
+  --header 'Content-Type: application/json' \
+  --data '{"name":"Egg Tart","price_cents":350,"active":true}'
+```
+
+Update a sale item, replacing `6` with the item ID returned by the create call:
+
+```sh
+curl --user "$AUTH" \
+  --request PUT "$BASE_URL/api/v1/sale-items/6" \
+  --header 'Content-Type: application/json' \
+  --data '{"name":"Egg Tart","price_cents":400,"active":true}'
+```
+
+Mark a sale item inactive:
+
+```sh
+curl --user "$AUTH" --request DELETE "$BASE_URL/api/v1/sale-items/6"
+```
+
+List printer configuration:
+
+```sh
+curl --user "$AUTH" "$BASE_URL/api/v1/printers"
+```
+
+Load one printer configuration:
+
+```sh
+curl --user "$AUTH" "$BASE_URL/api/v1/printers/cashier"
+```
+
+Save cashier printer configuration:
+
+```sh
+curl --user "$AUTH" \
+  --request PUT "$BASE_URL/api/v1/printers/cashier" \
+  --header 'Content-Type: application/json' \
+  --data '{"host":"192.168.1.50","port":9100,"enabled":true}'
+```
+
+Save kitchen printer configuration:
+
+```sh
+curl --user "$AUTH" \
+  --request PUT "$BASE_URL/api/v1/printers/kitchen" \
+  --header 'Content-Type: application/json' \
+  --data '{"host":"192.168.1.51","port":9100,"enabled":true}'
+```
+
+Submit an order using active sale item IDs:
+
+```sh
+curl --user "$AUTH" \
+  --request POST "$BASE_URL/api/v1/orders" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "items": [
+      {"sale_item_id":1,"quantity":2},
+      {"sale_item_id":4,"quantity":1}
+    ]
+  }'
+```
+
+List saved orders:
+
+```sh
+curl --user "$AUTH" "$BASE_URL/api/v1/orders"
+```
+
+Load one order, replacing `1` with the order ID:
+
+```sh
+curl --user "$AUTH" "$BASE_URL/api/v1/orders/1"
+```
+
+Temporary legacy order endpoint for older clients:
+
+```sh
+curl --user "$AUTH" \
+  --request POST "$BASE_URL/orders" \
+  --header 'Content-Type: application/json' \
+  --data '{"items":[{"name":"Milk Tea","price":4.5,"quantity":2}],"total":9}'
 ```
 
 ## Test
