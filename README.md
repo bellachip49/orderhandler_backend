@@ -49,7 +49,7 @@ HOST=127.0.0.1 go run .
 - `GET /health` returns `{"status":"ok"}`.
 - `GET /api/v1/catalog` returns only active sale items for the iPad ordering screen.
 - `GET /api/v1/sale-items` lists all sale items, including inactive items.
-- `POST /api/v1/sale-items` creates a sale item using `name`, `price_cents`, and `active`.
+- `POST /api/v1/sale-items` creates a sale item using `name`, `description`, `price_cents`, and `active`.
 - `PUT /api/v1/sale-items/{id}` updates a sale item.
 - `DELETE /api/v1/sale-items/{id}` marks a sale item inactive.
 - `GET /api/v1/printers` lists cashier and kitchen printer configuration.
@@ -61,6 +61,8 @@ HOST=127.0.0.1 go run .
 - Legacy `GET /orders` and `POST /orders` remain temporarily available for older clients.
 
 All endpoints except `/health` require HTTP Basic Auth. Configure credentials with `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD`; defaults are `admin` and `orderbackend`.
+
+Receipt printer text defaults to UTF-8 so Chinese descriptions print correctly on printers that match the iOS SDK demo's `NSUTF8StringEncoding` path. If a printer is configured for GBK/Chinese mode instead, start the backend with `PRINTER_TEXT_ENCODING=gbk`.
 
 Create an order using the menu items from ReceiptPrinterApp:
 
@@ -216,7 +218,7 @@ Create a sale item:
 curl --user "$AUTH" \
   --request POST "$BASE_URL/api/v1/sale-items" \
   --header 'Content-Type: application/json' \
-  --data '{"name":"Egg Tart","price_cents":350,"active":true}'
+  --data '{"name":"Egg Tart","description":"Warm custard tart","price_cents":350,"active":true}'
 ```
 
 Update a sale item, replacing `6` with the item ID returned by the create call:
@@ -225,7 +227,7 @@ Update a sale item, replacing `6` with the item ID returned by the create call:
 curl --user "$AUTH" \
   --request PUT "$BASE_URL/api/v1/sale-items/6" \
   --header 'Content-Type: application/json' \
-  --data '{"name":"Egg Tart","price_cents":400,"active":true}'
+  --data '{"name":"Egg Tart","description":"Updated tart description","price_cents":400,"active":true}'
 ```
 
 Mark a sale item inactive:

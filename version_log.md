@@ -1,5 +1,28 @@
 # Version Log
 
+## v1
+
+Completed the backend API refactor for the cashier ordering workflow, making the backend the system of record for catalog, orders, printer configuration, persistence, authentication, API documentation, and receipt printing.
+
+- Added versioned `/api/v1` APIs for catalog retrieval, sale-item management, printer configuration, order submission, order listing, and order detail lookup while keeping the temporary legacy `/orders` endpoint for older clients.
+- Added backend-owned sale item storage with `name`, `description`, `price_cents`, `active`, timestamps, default seed data, and active-only catalog behavior for the ordering screen.
+- Added sale item create, update, and inactive/delete behavior for the settings workflow; inactive items stay in the settings list, are hidden from `/api/v1/catalog`, and are rejected during order creation.
+- Added backend-owned order creation from sale item IDs and quantities, including generated readable order numbers, integer-cent totals, duplicate item validation, inactive/missing item validation, and saved item snapshots.
+- Added `description` snapshots to `order_items` so printed and historical orders keep the sale item description from checkout time even if the catalog item changes later.
+- Added SQLite tables and migrations for sale items, printer configuration, orders, order items, and print jobs, including compatibility handling for the original prototype `orders` table.
+- Added cashier and kitchen printer configuration APIs with role validation, host/port/enabled persistence, default printer rows, and default TCP port `9100`.
+- Added per-printer print jobs for each submitted order, with status updates for sent, failed, skipped, disabled, and unconfigured printer cases.
+- Refactored printing to backend-owned raw TCP dispatch with timeout handling, full-write validation, ESC/POS initialization, alignment, dividers, feed spacing, and full-cut commands.
+- Added separate receipt templates: cashier receipts include item subtotals, totals, and thank-you text; kitchen tickets are food-only and omit prices, totals, and thank-you text.
+- Added receipt item descriptions under item names for both cashier and kitchen tickets.
+- Added Chinese receipt text support with configurable `PRINTER_TEXT_ENCODING`; UTF-8 is the default for the physical printer, while `gbk` remains available as a compatibility fallback with SDK Chinese-mode commands.
+- Added receipt text sanitizing that removes emojis and emoji joiners/variation selectors before sending printable text to printers.
+- Added HTTP Basic Auth to all routes except `/health`, configurable with `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD`, with failed-authentication logging that avoids logging passwords.
+- Added `backend/openapi.yaml` and Swagger UI support through the local Docker Compose stack.
+- Updated Docker Compose for local testing with persistent SQLite storage, API service, and Swagger UI, and added a root Makefile for starting, stopping, destroying, inspecting, and testing the local stack.
+- Expanded README documentation with setup, configuration, Basic Auth, printer encoding, local stack usage, Swagger UI access, and curl examples for backend functions.
+- Expanded backend tests for authentication, catalog behavior, sale item CRUD and inactive behavior, printer configuration, order creation, order snapshots, OpenAPI coverage, TCP printer behavior, disabled printer logging, receipt rendering, Chinese text encoding, emoji omission, and error cases.
+
 ## v0.0.4
 
 Persisted orders to a local SQLite database instead of keeping them only in memory.

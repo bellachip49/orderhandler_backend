@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/text/encoding/simplifiedchinese"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -48,6 +50,31 @@ func authedRequest(method string, target string, body io.Reader) *http.Request {
 	request := httptest.NewRequest(method, target, body)
 	request.SetBasicAuth("test-user", "test-pass")
 	return request
+}
+
+func TestPrinterTextEncodingFromEnvironment(t *testing.T) {
+	t.Setenv("PRINTER_TEXT_ENCODING", "")
+	encoding, err := printerTextEncodingFromEnvironment()
+	if err != nil {
+		t.Fatalf("default printer text encoding: %v", err)
+	}
+	if encoding != printerTextEncodingUTF8 {
+		t.Fatalf("default printer text encoding = %q, want %q", encoding, printerTextEncodingUTF8)
+	}
+
+	t.Setenv("PRINTER_TEXT_ENCODING", "gbk")
+	encoding, err = printerTextEncodingFromEnvironment()
+	if err != nil {
+		t.Fatalf("gbk printer text encoding: %v", err)
+	}
+	if encoding != printerTextEncodingGBK {
+		t.Fatalf("printer text encoding = %q, want %q", encoding, printerTextEncodingGBK)
+	}
+
+	t.Setenv("PRINTER_TEXT_ENCODING", "latin1")
+	if _, err := printerTextEncodingFromEnvironment(); err == nil {
+		t.Fatal("invalid printer text encoding error = nil, want error")
+	}
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -164,7 +191,7 @@ func TestCatalogReturnsOnlyActiveSaleItems(t *testing.T) {
 
 func TestSaleItemCRUD(t *testing.T) {
 	_, handler := newTestApp(t)
-	createBody := []byte(`{"name":"Egg Tart","price_cents":350,"active":true}`)
+	createBody := []byte(`{"name":"Egg Tart","description":"Warm custard tart","price_cents":350,"active":true}`)
 	createResponse := httptest.NewRecorder()
 	handler.ServeHTTP(createResponse, authedRequest(http.MethodPost, "/api/v1/sale-items", bytes.NewReader(createBody)))
 
@@ -175,11 +202,11 @@ func TestSaleItemCRUD(t *testing.T) {
 	if err := json.NewDecoder(createResponse.Body).Decode(&created); err != nil {
 		t.Fatalf("decode created item: %v", err)
 	}
-	if created.ID == 0 || created.Name != "Egg Tart" || created.PriceCents != 350 || !created.Active {
+	if created.ID == 0 || created.Name != "Egg Tart" || created.Description != "Warm custard tart" || created.PriceCents != 350 || !created.Active {
 		t.Fatalf("created item = %+v, want Egg Tart", created)
 	}
 
-	updateBody := []byte(`{"name":"Egg Tart","price_cents":400,"active":false}`)
+	updateBody := []byte(`{"name":"Egg Tart","description":"Updated tart description","price_cents":400,"active":false}`)
 	updateResponse := httptest.NewRecorder()
 	handler.ServeHTTP(updateResponse, authedRequest(http.MethodPut, "/api/v1/sale-items/"+jsonNumber(created.ID), bytes.NewReader(updateBody)))
 
@@ -187,8 +214,71 @@ func TestSaleItemCRUD(t *testing.T) {
 	if err := json.NewDecoder(updateResponse.Body).Decode(&updated); err != nil {
 		t.Fatalf("decode updated item: %v", err)
 	}
-	if updated.PriceCents != 400 || updated.Active {
+	if updated.Description != "Updated tart description" || updated.PriceCents != 400 || updated.Active {
 		t.Fatalf("updated item = %+v, want inactive item at 400 cents", updated)
+	}
+}
+
+func TestDeleteSaleItemMarksItInactiveAndKeepsItInSettingsList(t *testing.T) {
+	_, handler := newTestApp(t)
+	createBody := []byte(`{"name":"Egg Tart","description":"Warm custard tart","price_cents":350,"active":true}`)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, authedRequest(http.MethodPost, "/api/v1/sale-items", bytes.NewReader(createBody)))
+
+	var created SaleItem
+	if err := json.NewDecoder(createResponse.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created item: %v", err)
+	}
+
+	deleteResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deleteResponse, authedRequest(http.MethodDelete, "/api/v1/sale-items/"+jsonNumber(created.ID), nil))
+
+	if deleteResponse.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want %d", deleteResponse.Code, http.StatusNoContent)
+	}
+
+	listResponse := httptest.NewRecorder()
+	handler.ServeHTTP(listResponse, authedRequest(http.MethodGet, "/api/v1/sale-items", nil))
+
+	var items []SaleItem
+	if err := json.NewDecoder(listResponse.Body).Decode(&items); err != nil {
+		t.Fatalf("decode sale items: %v", err)
+	}
+	found := false
+	for _, item := range items {
+		if item.ID == created.ID {
+			found = true
+			if item.Active {
+				t.Fatalf("deleted item = %+v, want inactive", item)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("soft-deleted item was not returned in settings list")
+	}
+
+	catalogResponse := httptest.NewRecorder()
+	handler.ServeHTTP(catalogResponse, authedRequest(http.MethodGet, "/api/v1/catalog", nil))
+
+	var catalog []SaleItem
+	if err := json.NewDecoder(catalogResponse.Body).Decode(&catalog); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	for _, item := range catalog {
+		if item.ID == created.ID {
+			t.Fatalf("inactive item still returned in catalog: %+v", item)
+		}
+	}
+}
+
+func TestDeleteMissingSaleItemReturnsNotFound(t *testing.T) {
+	_, handler := newTestApp(t)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, authedRequest(http.MethodDelete, "/api/v1/sale-items/99999", nil))
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
 	}
 }
 
@@ -237,11 +327,54 @@ func TestCreateOrderUsesCatalogSnapshotAndCreatesPrintJobs(t *testing.T) {
 	if len(order.Items) != 1 || order.Items[0].Name != items[0].Name || order.Items[0].SubtotalCents != items[0].PriceCents*2 {
 		t.Fatalf("order items = %+v, want catalog snapshot", order.Items)
 	}
+	if order.Items[0].Description != items[0].Description {
+		t.Fatalf("order item description = %q, want catalog description %q", order.Items[0].Description, items[0].Description)
+	}
 	if order.TotalCents != items[0].PriceCents*2 {
 		t.Fatalf("total_cents = %d, want %d", order.TotalCents, items[0].PriceCents*2)
 	}
 	if len(order.PrintJobs) != 2 {
 		t.Fatalf("print job count = %d, want 2", len(order.PrintJobs))
+	}
+}
+
+func TestDeactivatingSaleItemKeepsOldOrderSnapshotsReadable(t *testing.T) {
+	application, handler := newTestApp(t)
+	items, err := application.store.listSaleItems(true)
+	if err != nil {
+		t.Fatalf("list sale items: %v", err)
+	}
+	orderedItem := items[0]
+	body := []byte(`{"items":[{"sale_item_id":` + jsonNumber(orderedItem.ID) + `,"quantity":2}]}`)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, authedRequest(http.MethodPost, "/api/v1/orders", bytes.NewReader(body)))
+
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create order status = %d, want %d", createResponse.Code, http.StatusCreated)
+	}
+	var createdOrder Order
+	if err := json.NewDecoder(createResponse.Body).Decode(&createdOrder); err != nil {
+		t.Fatalf("decode created order: %v", err)
+	}
+
+	deleteResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deleteResponse, authedRequest(http.MethodDelete, "/api/v1/sale-items/"+jsonNumber(orderedItem.ID), nil))
+	if deleteResponse.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want %d", deleteResponse.Code, http.StatusNoContent)
+	}
+
+	getOrderResponse := httptest.NewRecorder()
+	handler.ServeHTTP(getOrderResponse, authedRequest(http.MethodGet, "/api/v1/orders/"+jsonNumber(createdOrder.ID), nil))
+
+	if getOrderResponse.Code != http.StatusOK {
+		t.Fatalf("get order status = %d, want %d", getOrderResponse.Code, http.StatusOK)
+	}
+	var fetchedOrder Order
+	if err := json.NewDecoder(getOrderResponse.Body).Decode(&fetchedOrder); err != nil {
+		t.Fatalf("decode fetched order: %v", err)
+	}
+	if len(fetchedOrder.Items) != 1 || fetchedOrder.Items[0].Name != orderedItem.Name || fetchedOrder.Items[0].UnitPriceCents != orderedItem.PriceCents {
+		t.Fatalf("fetched order items = %+v, want snapshot for inactive item", fetchedOrder.Items)
 	}
 }
 
@@ -320,7 +453,7 @@ func TestOpenDatabaseRenamesPrototypeOrdersTable(t *testing.T) {
 func TestCashierTicketMatchesCommittedReceiptInstructions(t *testing.T) {
 	order := testPrintOrder()
 	ticket := cashierTicket(order)
-	text := StringFromASCII(ticket)
+	text := string(ticket)
 
 	if got := []byte(ticket[:2]); !bytes.Equal(got, []byte{0x1B, 0x40}) {
 		t.Fatalf("ticket prefix = %v, want ESC @", got)
@@ -328,12 +461,17 @@ func TestCashierTicketMatchesCommittedReceiptInstructions(t *testing.T) {
 	if got := []byte(ticket[2:5]); !bytes.Equal(got, []byte{0x1B, 0x61, 0x00}) {
 		t.Fatalf("alignment command = %v, want left align", got)
 	}
+	if bytes.Contains(ticket, []byte{0x1C, 0x26}) {
+		t.Fatalf("cashier ticket contains GBK Chinese mode command in UTF-8 mode: %v", ticket)
+	}
 	for _, want := range []string{
 		"Order #1001\n",
 		"------------------------------",
 		"07/29/26  9:37 AM",
 		"2  Milk Tea             $11.00",
+		"   港式奶茶",
 		"1  Green Tea             $5.00",
+		"   茉莉綠茶",
 		"TOTAL                   $16.00",
 		"Thank you!",
 	} {
@@ -344,6 +482,9 @@ func TestCashierTicketMatchesCommittedReceiptInstructions(t *testing.T) {
 	if got := []byte(ticket[len(ticket)-9 : len(ticket)-3]); !bytes.Equal(got, []byte{'\n', '\n', '\n', '\n', '\n', '\n'}) {
 		t.Fatalf("feed bytes = %v, want six newlines", got)
 	}
+	if bytes.Contains(ticket, []byte{0x1C, 0x2E}) {
+		t.Fatalf("cashier ticket contains cancel Chinese mode command in UTF-8 mode: %v", ticket)
+	}
 	if got := []byte(ticket[len(ticket)-3:]); !bytes.Equal(got, []byte{0x1D, 0x56, 0x00}) {
 		t.Fatalf("cut bytes = %v, want GS V 0", got)
 	}
@@ -352,13 +493,15 @@ func TestCashierTicketMatchesCommittedReceiptInstructions(t *testing.T) {
 func TestKitchenTicketIsFoodOnlyWithOrderNumber(t *testing.T) {
 	order := testPrintOrder()
 	ticket := kitchenTicket(order)
-	text := StringFromASCII(ticket)
+	text := string(ticket)
 
 	for _, want := range []string{
 		"Order #1001\n",
 		"07/29/26  9:37 AM",
 		"2  Milk Tea",
+		"   港式奶茶",
 		"1  Green Tea",
+		"   茉莉綠茶",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("kitchen ticket missing %q in %q", want, text)
@@ -369,11 +512,71 @@ func TestKitchenTicketIsFoodOnlyWithOrderNumber(t *testing.T) {
 			t.Fatalf("kitchen ticket should not contain %q in %q", notWant, text)
 		}
 	}
+	if bytes.Contains(ticket, []byte{0x1C, 0x26}) {
+		t.Fatalf("kitchen ticket contains GBK Chinese mode command in UTF-8 mode: %v", ticket)
+	}
 	if got := []byte(ticket[5:8]); !bytes.Equal(got, []byte{0x1D, 0x21, 0x11}) {
 		t.Fatalf("kitchen order number size command = %v, want double size", got)
 	}
+	if bytes.Contains(ticket, []byte{0x1C, 0x2E}) {
+		t.Fatalf("kitchen ticket contains cancel Chinese mode command in UTF-8 mode: %v", ticket)
+	}
 	if got := []byte(ticket[len(ticket)-3:]); !bytes.Equal(got, []byte{0x1D, 0x56, 0x00}) {
 		t.Fatalf("cut bytes = %v, want GS V 0", got)
+	}
+}
+
+func TestGBKReceiptPrintingUsesChineseModeCommands(t *testing.T) {
+	order := testPrintOrder()
+	ticket := cashierTicketWithEncoding(order, printerTextEncodingGBK)
+	text := StringFromGBKPrinterText(t, ticket)
+
+	if got := []byte(ticket[5:7]); !bytes.Equal(got, []byte{0x1C, 0x26}) {
+		t.Fatalf("Chinese mode command = %v, want FS &", got)
+	}
+	if got := []byte(ticket[len(ticket)-5 : len(ticket)-3]); !bytes.Equal(got, []byte{0x1C, 0x2E}) {
+		t.Fatalf("cancel Chinese mode command = %v, want FS .", got)
+	}
+	for _, want := range []string{"   港式奶茶", "   茉莉綠茶"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("GBK ticket missing %q in %q", want, text)
+		}
+	}
+}
+
+func TestReceiptPrintingOmitsEmojis(t *testing.T) {
+	order := testPrintOrder()
+	order.Items = []OrderItem{
+		{Name: "Spicy Noodles 🔥", Description: "招牌辣麵 🔥", UnitPriceCents: 800, Quantity: 1, SubtotalCents: 800},
+	}
+	ticket := cashierTicket(order)
+	text := string(ticket)
+
+	if strings.Contains(text, "🔥") {
+		t.Fatalf("ticket = %q, want emoji omitted", text)
+	}
+	for _, want := range []string{"1  Spicy Noodles", "   招牌辣麵"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("ticket missing %q in %q", want, text)
+		}
+	}
+}
+
+func TestReceiptPrintingOmitsEmojisInGBKMode(t *testing.T) {
+	order := testPrintOrder()
+	order.Items = []OrderItem{
+		{Name: "Spicy Noodles 🔥", Description: "招牌辣麵 🔥", UnitPriceCents: 800, Quantity: 1, SubtotalCents: 800},
+	}
+	ticket := cashierTicketWithEncoding(order, printerTextEncodingGBK)
+	text := StringFromGBKPrinterText(t, ticket)
+
+	if strings.Contains(text, "🔥") {
+		t.Fatalf("ticket = %q, want emoji omitted", text)
+	}
+	for _, want := range []string{"1  Spicy Noodles", "   招牌辣麵"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("ticket missing %q in %q", want, text)
+		}
 	}
 }
 
@@ -409,6 +612,12 @@ func TestTCPPrinterServiceWritesRoleSpecificTicket(t *testing.T) {
 	text := StringFromASCII(connection.written.Bytes())
 	if !strings.Contains(text, "Order #1001") || strings.Contains(text, "TOTAL") {
 		t.Fatalf("written ticket = %q, want kitchen ticket", text)
+	}
+	if !strings.Contains(text, "港式奶茶") {
+		t.Fatalf("written ticket = %q, want UTF-8 Chinese text", text)
+	}
+	if bytes.Contains(connection.written.Bytes(), []byte{0x1C, 0x26}) {
+		t.Fatalf("written ticket contains GBK Chinese mode command in default UTF-8 mode: %v", connection.written.Bytes())
 	}
 }
 
@@ -490,8 +699,8 @@ func testPrintOrder() Order {
 		OrderNumber: "1001",
 		CreatedAt:   "2026-07-29T09:37:00-07:00",
 		Items: []OrderItem{
-			{Name: "Milk Tea", UnitPriceCents: 550, Quantity: 2, SubtotalCents: 1100},
-			{Name: "Green Tea", UnitPriceCents: 500, Quantity: 1, SubtotalCents: 500},
+			{Name: "Milk Tea", Description: "港式奶茶", UnitPriceCents: 550, Quantity: 2, SubtotalCents: 1100},
+			{Name: "Green Tea", Description: "茉莉綠茶", UnitPriceCents: 500, Quantity: 1, SubtotalCents: 500},
 		},
 		TotalCents: 1600,
 	}
@@ -499,6 +708,16 @@ func testPrintOrder() Order {
 
 func StringFromASCII(data []byte) string {
 	return string(data)
+}
+
+func StringFromGBKPrinterText(t *testing.T, data []byte) string {
+	t.Helper()
+
+	decoded, err := simplifiedchinese.GBK.NewDecoder().String(string(data))
+	if err != nil {
+		t.Fatalf("decode printer text: %v", err)
+	}
+	return decoded
 }
 
 type fakeNetConn struct {

@@ -19,6 +19,9 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
+
 	_ "modernc.org/sqlite"
 	_ "time/tzdata"
 )
@@ -30,6 +33,14 @@ const defaultPrinterPort = 9100
 const startingOrderNumber = 1000
 const defaultBasicAuthUsername = "admin"
 const defaultBasicAuthPassword = "orderbackend"
+const defaultPrinterTextEncoding = printerTextEncodingUTF8
+
+type printerTextEncoding string
+
+const (
+	printerTextEncodingUTF8 printerTextEncoding = "utf8"
+	printerTextEncodingGBK  printerTextEncoding = "gbk"
+)
 
 var pacificLocation = func() *time.Location {
 	loc, err := time.LoadLocation("America/Los_Angeles")
@@ -57,9 +68,14 @@ func main() {
 	}
 	defer db.Close()
 
+	textEncoding, err := printerTextEncodingFromEnvironment()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	application := &app{
 		store:   &store{db: db},
-		printer: TCPPrinterService{Timeout: 8 * time.Second},
+		printer: TCPPrinterService{Timeout: 8 * time.Second, TextEncoding: textEncoding},
 		auth:    basicAuthFromEnvironment(),
 	}
 
@@ -137,6 +153,21 @@ func basicAuthFromEnvironment() basicAuthConfig {
 	return basicAuthConfig{Username: username, Password: password}
 }
 
+func printerTextEncodingFromEnvironment() (printerTextEncoding, error) {
+	return parsePrinterTextEncoding(os.Getenv("PRINTER_TEXT_ENCODING"))
+}
+
+func parsePrinterTextEncoding(value string) (printerTextEncoding, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", string(printerTextEncodingUTF8):
+		return printerTextEncodingUTF8, nil
+	case string(printerTextEncodingGBK):
+		return printerTextEncodingGBK, nil
+	default:
+		return "", errors.New("PRINTER_TEXT_ENCODING must be utf8 or gbk")
+	}
+}
+
 func openDatabase(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -157,11 +188,55 @@ func openDatabase(path string) (*sql.DB, error) {
 			return nil, err
 		}
 	}
+	if err := ensureSaleItemDescriptionColumn(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureOrderItemDescriptionColumn(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := seedDefaults(db); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+func ensureSaleItemDescriptionColumn(db *sql.DB) error {
+	return ensureColumn(db, "sale_items", "description", `ALTER TABLE sale_items ADD COLUMN description TEXT NOT NULL DEFAULT ''`)
+}
+
+func ensureOrderItemDescriptionColumn(db *sql.DB) error {
+	return ensureColumn(db, "order_items", "description", `ALTER TABLE order_items ADD COLUMN description TEXT NOT NULL DEFAULT ''`)
+}
+
+func ensureColumn(db *sql.DB, tableName string, columnName string, alterStatement string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + tableName + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == columnName {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	_, err = db.Exec(alterStatement)
+	return err
 }
 
 func migrateLegacySchema(db *sql.DB) error {
@@ -217,6 +292,7 @@ var schemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS sale_items (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL,
+		description TEXT NOT NULL DEFAULT '',
 		price_cents INTEGER NOT NULL CHECK(price_cents >= 0),
 		active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
 		created_at TEXT NOT NULL,
@@ -241,6 +317,7 @@ var schemaStatements = []string{
 		order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
 		sale_item_id INTEGER,
 		name TEXT NOT NULL,
+		description TEXT NOT NULL DEFAULT '',
 		unit_price_cents INTEGER NOT NULL CHECK(unit_price_cents >= 0),
 		quantity INTEGER NOT NULL CHECK(quantity > 0),
 		subtotal_cents INTEGER NOT NULL CHECK(subtotal_cents >= 0)
@@ -279,16 +356,16 @@ func seedDefaults(db *sql.DB) error {
 		return nil
 	}
 	defaults := []SaleItem{
-		{Name: "Dumplings", PriceCents: 600, Active: true},
-		{Name: "Cart Noodles", PriceCents: 800, Active: true},
-		{Name: "Fish balls", PriceCents: 500, Active: true},
-		{Name: "Milk Tea", PriceCents: 450, Active: true},
-		{Name: "Potato Chips", PriceCents: 250, Active: true},
+		{Name: "Dumplings", Description: "Item description placeholder", PriceCents: 600, Active: true},
+		{Name: "Cart Noodles", Description: "Item description placeholder", PriceCents: 800, Active: true},
+		{Name: "Fish balls", Description: "Item description placeholder", PriceCents: 500, Active: true},
+		{Name: "Milk Tea", Description: "Item description placeholder", PriceCents: 450, Active: true},
+		{Name: "Potato Chips", Description: "Item description placeholder", PriceCents: 250, Active: true},
 	}
 	for _, item := range defaults {
 		if _, err := db.Exec(
-			`INSERT INTO sale_items (name, price_cents, active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)`,
-			item.Name, item.PriceCents, now, now,
+			`INSERT INTO sale_items (name, description, price_cents, active, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)`,
+			item.Name, item.Description, item.PriceCents, now, now,
 		); err != nil {
 			return err
 		}
@@ -633,12 +710,13 @@ var errNotFound = errors.New("not found")
 var errValidation = errors.New("validation failed")
 
 type SaleItem struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	PriceCents int    `json:"price_cents"`
-	Active     bool   `json:"active"`
-	CreatedAt  string `json:"created_at"`
-	UpdatedAt  string `json:"updated_at"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	PriceCents  int    `json:"price_cents"`
+	Active      bool   `json:"active"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
 }
 
 type Printer struct {
@@ -663,6 +741,7 @@ type OrderItem struct {
 	ID             int64  `json:"id,omitempty"`
 	SaleItemID     int64  `json:"sale_item_id,omitempty"`
 	Name           string `json:"name"`
+	Description    string `json:"description"`
 	UnitPriceCents int    `json:"unit_price_cents"`
 	Quantity       int    `json:"quantity"`
 	SubtotalCents  int    `json:"subtotal_cents"`
@@ -680,9 +759,10 @@ type PrintJob struct {
 }
 
 type saleItemRequest struct {
-	Name       string `json:"name"`
-	PriceCents int    `json:"price_cents"`
-	Active     bool   `json:"active"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	PriceCents  int    `json:"price_cents"`
+	Active      bool   `json:"active"`
 }
 
 func (r saleItemRequest) toSaleItem() (SaleItem, error) {
@@ -693,7 +773,12 @@ func (r saleItemRequest) toSaleItem() (SaleItem, error) {
 	if r.PriceCents < 0 {
 		return SaleItem{}, errors.New("price_cents must not be negative")
 	}
-	return SaleItem{Name: name, PriceCents: r.PriceCents, Active: r.Active}, nil
+	return SaleItem{
+		Name:        name,
+		Description: strings.TrimSpace(r.Description),
+		PriceCents:  r.PriceCents,
+		Active:      r.Active,
+	}, nil
 }
 
 type printerRequest struct {
@@ -738,7 +823,7 @@ type legacyOrderRequest struct {
 }
 
 func (s *store) listSaleItems(activeOnly bool) ([]SaleItem, error) {
-	query := "SELECT id, name, price_cents, active, created_at, updated_at FROM sale_items"
+	query := "SELECT id, name, description, price_cents, active, created_at, updated_at FROM sale_items"
 	if activeOnly {
 		query += " WHERE active = 1"
 	}
@@ -764,7 +849,7 @@ func scanSaleItem(rows interface {
 }) (SaleItem, error) {
 	var item SaleItem
 	var active int
-	if err := rows.Scan(&item.ID, &item.Name, &item.PriceCents, &active, &item.CreatedAt, &item.UpdatedAt); err != nil {
+	if err := rows.Scan(&item.ID, &item.Name, &item.Description, &item.PriceCents, &active, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return SaleItem{}, err
 	}
 	item.Active = active == 1
@@ -774,8 +859,8 @@ func scanSaleItem(rows interface {
 func (s *store) createSaleItem(item SaleItem) (SaleItem, error) {
 	now := nowString()
 	result, err := s.db.Exec(
-		`INSERT INTO sale_items (name, price_cents, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		item.Name, item.PriceCents, boolInt(item.Active), now, now,
+		`INSERT INTO sale_items (name, description, price_cents, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		item.Name, item.Description, item.PriceCents, boolInt(item.Active), now, now,
 	)
 	if err != nil {
 		return SaleItem{}, err
@@ -793,8 +878,8 @@ func (s *store) createSaleItem(item SaleItem) (SaleItem, error) {
 func (s *store) updateSaleItem(item SaleItem) (SaleItem, error) {
 	now := nowString()
 	result, err := s.db.Exec(
-		`UPDATE sale_items SET name = ?, price_cents = ?, active = ?, updated_at = ? WHERE id = ?`,
-		item.Name, item.PriceCents, boolInt(item.Active), now, item.ID,
+		`UPDATE sale_items SET name = ?, description = ?, price_cents = ?, active = ?, updated_at = ? WHERE id = ?`,
+		item.Name, item.Description, item.PriceCents, boolInt(item.Active), now, item.ID,
 	)
 	if err != nil {
 		return SaleItem{}, err
@@ -825,7 +910,7 @@ func (s *store) setSaleItemActive(id int64, active bool) error {
 }
 
 func (s *store) getSaleItem(id int64) (SaleItem, error) {
-	row := s.db.QueryRow(`SELECT id, name, price_cents, active, created_at, updated_at FROM sale_items WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT id, name, description, price_cents, active, created_at, updated_at FROM sale_items WHERE id = ?`, id)
 	item, err := scanSaleItem(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SaleItem{}, errNotFound
@@ -917,9 +1002,9 @@ func (s *store) createOrder(request createOrderRequest) (Order, []PrintJob, erro
 		var item SaleItem
 		var active int
 		err := tx.QueryRow(
-			`SELECT id, name, price_cents, active, created_at, updated_at FROM sale_items WHERE id = ?`,
+			`SELECT id, name, description, price_cents, active, created_at, updated_at FROM sale_items WHERE id = ?`,
 			requestItem.SaleItemID,
-		).Scan(&item.ID, &item.Name, &item.PriceCents, &active, &item.CreatedAt, &item.UpdatedAt)
+		).Scan(&item.ID, &item.Name, &item.Description, &item.PriceCents, &active, &item.CreatedAt, &item.UpdatedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return Order{}, nil, fmt.Errorf("%w: sale item %d was not found", errValidation, requestItem.SaleItemID)
 		}
@@ -934,6 +1019,7 @@ func (s *store) createOrder(request createOrderRequest) (Order, []PrintJob, erro
 		orderItems = append(orderItems, OrderItem{
 			SaleItemID:     item.ID,
 			Name:           item.Name,
+			Description:    item.Description,
 			UnitPriceCents: item.PriceCents,
 			Quantity:       requestItem.Quantity,
 			SubtotalCents:  subtotal,
@@ -955,8 +1041,8 @@ func (s *store) createOrder(request createOrderRequest) (Order, []PrintJob, erro
 	}
 	for i := range orderItems {
 		result, err := tx.Exec(
-			`INSERT INTO order_items (order_id, sale_item_id, name, unit_price_cents, quantity, subtotal_cents) VALUES (?, ?, ?, ?, ?, ?)`,
-			orderID, orderItems[i].SaleItemID, orderItems[i].Name, orderItems[i].UnitPriceCents, orderItems[i].Quantity, orderItems[i].SubtotalCents,
+			`INSERT INTO order_items (order_id, sale_item_id, name, description, unit_price_cents, quantity, subtotal_cents) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			orderID, orderItems[i].SaleItemID, orderItems[i].Name, orderItems[i].Description, orderItems[i].UnitPriceCents, orderItems[i].Quantity, orderItems[i].SubtotalCents,
 		)
 		if err != nil {
 			return Order{}, nil, err
@@ -1035,8 +1121,8 @@ func (s *store) createOrderFromSnapshot(items []OrderItem, total int) (Order, []
 	}
 	for i := range items {
 		result, err := tx.Exec(
-			`INSERT INTO order_items (order_id, name, unit_price_cents, quantity, subtotal_cents) VALUES (?, ?, ?, ?, ?)`,
-			orderID, items[i].Name, items[i].UnitPriceCents, items[i].Quantity, items[i].SubtotalCents,
+			`INSERT INTO order_items (order_id, name, description, unit_price_cents, quantity, subtotal_cents) VALUES (?, ?, ?, ?, ?, ?)`,
+			orderID, items[i].Name, items[i].Description, items[i].UnitPriceCents, items[i].Quantity, items[i].SubtotalCents,
 		)
 		if err != nil {
 			return Order{}, nil, err
@@ -1112,7 +1198,7 @@ func (s *store) getOrder(id int64) (Order, error) {
 
 func (s *store) listOrderItems(orderID int64) ([]OrderItem, error) {
 	rows, err := s.db.Query(
-		`SELECT id, COALESCE(sale_item_id, 0), name, unit_price_cents, quantity, subtotal_cents FROM order_items WHERE order_id = ? ORDER BY id`,
+		`SELECT id, COALESCE(sale_item_id, 0), name, description, unit_price_cents, quantity, subtotal_cents FROM order_items WHERE order_id = ? ORDER BY id`,
 		orderID,
 	)
 	if err != nil {
@@ -1122,7 +1208,7 @@ func (s *store) listOrderItems(orderID int64) ([]OrderItem, error) {
 	var items []OrderItem
 	for rows.Next() {
 		var item OrderItem
-		if err := rows.Scan(&item.ID, &item.SaleItemID, &item.Name, &item.UnitPriceCents, &item.Quantity, &item.SubtotalCents); err != nil {
+		if err := rows.Scan(&item.ID, &item.SaleItemID, &item.Name, &item.Description, &item.UnitPriceCents, &item.Quantity, &item.SubtotalCents); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -1163,8 +1249,9 @@ type PrinterService interface {
 }
 
 type TCPPrinterService struct {
-	Timeout time.Duration
-	Dial    func(network string, address string, timeout time.Duration) (net.Conn, error)
+	Timeout      time.Duration
+	TextEncoding printerTextEncoding
+	Dial         func(network string, address string, timeout time.Duration) (net.Conn, error)
 }
 
 func (s TCPPrinterService) Print(printer Printer, order Order) error {
@@ -1187,7 +1274,7 @@ func (s TCPPrinterService) Print(printer Printer, order Order) error {
 	if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
-	payload := renderTicket(printer.Role, order)
+	payload := renderTicketWithEncoding(printer.Role, order, s.textEncoding())
 	written, err := connection.Write(payload)
 	if err != nil {
 		return err
@@ -1198,80 +1285,156 @@ func (s TCPPrinterService) Print(printer Printer, order Order) error {
 	return nil
 }
 
-func renderTicket(role string, order Order) []byte {
-	if role == "kitchen" {
-		return kitchenTicket(order)
+func (s TCPPrinterService) textEncoding() printerTextEncoding {
+	if s.TextEncoding == "" {
+		return defaultPrinterTextEncoding
 	}
-	return cashierTicket(order)
+	return s.TextEncoding
+}
+
+func renderTicket(role string, order Order) []byte {
+	return renderTicketWithEncoding(role, order, defaultPrinterTextEncoding)
+}
+
+func renderTicketWithEncoding(role string, order Order, encoding printerTextEncoding) []byte {
+	if role == "kitchen" {
+		return kitchenTicketWithEncoding(order, encoding)
+	}
+	return cashierTicketWithEncoding(order, encoding)
 }
 
 const receiptWidth = 30
 
 func cashierTicket(order Order) []byte {
-	var buffer bytes.Buffer
-	buffer.Write([]byte{0x1B, 0x40})
-	buffer.Write([]byte{0x1B, 0x61, 0x00})
-	buffer.WriteString("Order #")
-	buffer.WriteString(order.OrderNumber)
-	buffer.WriteString("\n")
-	buffer.WriteString(divider(receiptWidth))
-	buffer.WriteString("\n")
-	buffer.WriteString(formatReceiptDate(order.CreatedAt))
-	buffer.WriteString("\n\n")
+	return cashierTicketWithEncoding(order, defaultPrinterTextEncoding)
+}
+
+func cashierTicketWithEncoding(order Order, encoding printerTextEncoding) []byte {
+	buffer := newReceiptBuffer(encoding)
+	buffer.command(0x1B, 0x40)
+	buffer.command(0x1B, 0x61, 0x00)
+	buffer.startText()
+	buffer.text("Order #")
+	buffer.text(order.OrderNumber)
+	buffer.text("\n")
+	buffer.text(divider(receiptWidth))
+	buffer.text("\n")
+	buffer.text(formatReceiptDate(order.CreatedAt))
+	buffer.text("\n\n")
 	for _, item := range order.Items {
-		buffer.WriteString(cashierItemLine(item))
-		buffer.WriteString("\n")
+		buffer.text(cashierItemLine(item))
+		buffer.text("\n")
+		if description := descriptionLine(item.Description); description != "" {
+			buffer.text(description)
+			buffer.text("\n")
+		}
 	}
-	buffer.WriteString("\n")
-	buffer.WriteString(divider(receiptWidth))
-	buffer.WriteString("\n")
-	buffer.WriteString(totalLine(order.TotalCents))
-	buffer.WriteString("\n\n")
-	buffer.WriteString("Thank you!\n")
-	buffer.WriteString(divider(receiptWidth))
-	buffer.WriteString("\n\n\n\n\n\n")
-	buffer.Write([]byte{0x1D, 0x56, 0x00})
-	return buffer.Bytes()
+	buffer.text("\n")
+	buffer.text(divider(receiptWidth))
+	buffer.text("\n")
+	buffer.text(totalLine(order.TotalCents))
+	buffer.text("\n\n")
+	buffer.text("Thank you!\n")
+	buffer.text(divider(receiptWidth))
+	buffer.text("\n\n\n\n\n\n")
+	buffer.endText()
+	buffer.command(0x1D, 0x56, 0x00)
+	return buffer.bytes()
 }
 
 func kitchenTicket(order Order) []byte {
-	var buffer bytes.Buffer
-	buffer.Write([]byte{0x1B, 0x40})
-	buffer.Write([]byte{0x1B, 0x61, 0x00})
-	buffer.Write([]byte{0x1D, 0x21, 0x11})
-	buffer.Write([]byte{0x1B, 0x45, 0x01})
-	buffer.WriteString("Order #")
-	buffer.WriteString(order.OrderNumber)
-	buffer.WriteString("\n")
-	buffer.Write([]byte{0x1B, 0x45, 0x00})
-	buffer.Write([]byte{0x1D, 0x21, 0x00})
-	buffer.WriteString(divider(receiptWidth))
-	buffer.WriteString("\n")
-	buffer.WriteString(formatReceiptDate(order.CreatedAt))
-	buffer.WriteString("\n\n")
+	return kitchenTicketWithEncoding(order, defaultPrinterTextEncoding)
+}
+
+func kitchenTicketWithEncoding(order Order, encoding printerTextEncoding) []byte {
+	buffer := newReceiptBuffer(encoding)
+	buffer.command(0x1B, 0x40)
+	buffer.command(0x1B, 0x61, 0x00)
+	buffer.startText()
+	buffer.command(0x1D, 0x21, 0x11)
+	buffer.command(0x1B, 0x45, 0x01)
+	buffer.text("Order #")
+	buffer.text(order.OrderNumber)
+	buffer.text("\n")
+	buffer.command(0x1B, 0x45, 0x00)
+	buffer.command(0x1D, 0x21, 0x00)
+	buffer.text(divider(receiptWidth))
+	buffer.text("\n")
+	buffer.text(formatReceiptDate(order.CreatedAt))
+	buffer.text("\n\n")
 	for _, item := range order.Items {
-		buffer.WriteString(kitchenItemLine(item))
-		buffer.WriteString("\n")
+		buffer.text(kitchenItemLine(item))
+		buffer.text("\n")
+		if description := descriptionLine(item.Description); description != "" {
+			buffer.text(description)
+			buffer.text("\n")
+		}
 	}
-	buffer.WriteString(divider(receiptWidth))
-	buffer.WriteString("\n\n\n\n\n\n")
-	buffer.Write([]byte{0x1D, 0x56, 0x00})
-	return buffer.Bytes()
+	buffer.text(divider(receiptWidth))
+	buffer.text("\n\n\n\n\n\n")
+	buffer.endText()
+	buffer.command(0x1D, 0x56, 0x00)
+	return buffer.bytes()
+}
+
+type receiptBuffer struct {
+	buffer   bytes.Buffer
+	encoding printerTextEncoding
+}
+
+func newReceiptBuffer(encoding printerTextEncoding) receiptBuffer {
+	if encoding == "" {
+		encoding = defaultPrinterTextEncoding
+	}
+	return receiptBuffer{encoding: encoding}
+}
+
+func (b *receiptBuffer) command(values ...byte) {
+	b.buffer.Write(values)
+}
+
+func (b *receiptBuffer) startText() {
+	if b.encoding == printerTextEncodingGBK {
+		b.command(0x1C, 0x26)
+	}
+}
+
+func (b *receiptBuffer) endText() {
+	if b.encoding == printerTextEncodingGBK {
+		b.command(0x1C, 0x2E)
+	}
+}
+
+func (b *receiptBuffer) text(value string) {
+	b.buffer.Write(encodePrinterText(value, b.encoding))
+}
+
+func (b *receiptBuffer) bytes() []byte {
+	return b.buffer.Bytes()
 }
 
 func cashierItemLine(item OrderItem) string {
 	prefix := strconv.Itoa(item.Quantity) + "  "
 	amount := formatMoney(item.SubtotalCents)
-	nameWidth := max(0, receiptWidth-len(prefix)-len(amount)-1)
-	name := truncateASCII(item.Name, nameWidth)
-	spaces := strings.Repeat(" ", max(1, receiptWidth-len(prefix)-len(name)-len(amount)))
+	nameWidth := max(0, receiptWidth-receiptTextWidth(prefix)-receiptTextWidth(amount)-1)
+	name := truncateReceiptText(item.Name, nameWidth)
+	spaces := strings.Repeat(" ", max(1, receiptWidth-receiptTextWidth(prefix)-receiptTextWidth(name)-receiptTextWidth(amount)))
 	return prefix + name + spaces + amount
 }
 
 func kitchenItemLine(item OrderItem) string {
 	prefix := strconv.Itoa(item.Quantity) + "  "
-	nameWidth := max(0, receiptWidth-len(prefix))
-	return prefix + truncateASCII(item.Name, nameWidth)
+	nameWidth := max(0, receiptWidth-receiptTextWidth(prefix))
+	return prefix + truncateReceiptText(item.Name, nameWidth)
+}
+
+func descriptionLine(description string) string {
+	description = strings.TrimSpace(stripEmoji(description))
+	if description == "" {
+		return ""
+	}
+	prefix := "   "
+	return prefix + truncateReceiptText(description, receiptWidth-receiptTextWidth(prefix))
 }
 
 func totalLine(totalCents int) string {
@@ -1297,14 +1460,66 @@ func divider(width int) string {
 	return strings.Repeat("-", width)
 }
 
-func truncateASCII(value string, width int) string {
+func truncateReceiptText(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if len(value) <= width {
-		return value
+	value = stripEmoji(value)
+	var builder strings.Builder
+	used := 0
+	for _, r := range value {
+		runeWidth := receiptRuneWidth(r)
+		if used+runeWidth > width {
+			break
+		}
+		builder.WriteRune(r)
+		used += runeWidth
 	}
-	return value[:width]
+	return builder.String()
+}
+
+func receiptTextWidth(value string) int {
+	width := 0
+	for _, r := range stripEmoji(value) {
+		width += receiptRuneWidth(r)
+	}
+	return width
+}
+
+func receiptRuneWidth(r rune) int {
+	if r <= 0x7F {
+		return 1
+	}
+	return 2
+}
+
+func encodePrinterText(value string, encoding printerTextEncoding) []byte {
+	value = stripEmoji(value)
+	if encoding != printerTextEncodingGBK {
+		return []byte(value)
+	}
+
+	output, _, err := transform.Bytes(simplifiedchinese.GB18030.NewEncoder(), []byte(value))
+	if err != nil {
+		return []byte(value)
+	}
+	return output
+}
+
+func stripEmoji(value string) string {
+	return strings.Map(func(r rune) rune {
+		if isEmojiRune(r) {
+			return -1
+		}
+		return r
+	}, value)
+}
+
+func isEmojiRune(r rune) bool {
+	return r == 0x200D ||
+		(r >= 0xFE00 && r <= 0xFE0F) ||
+		(r >= 0x2600 && r <= 0x27BF) ||
+		(r >= 0x1F000 && r <= 0x1FAFF)
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, value any) bool {

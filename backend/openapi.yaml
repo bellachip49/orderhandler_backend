@@ -274,6 +274,7 @@ components:
       required:
         - id
         - name
+        - description
         - price_cents
         - active
         - created_at
@@ -286,6 +287,9 @@ components:
         name:
           type: string
           example: Dumplings
+        description:
+          type: string
+          example: Item description placeholder
         price_cents:
           type: integer
           minimum: 0
@@ -309,6 +313,9 @@ components:
         name:
           type: string
           example: Egg Tart
+        description:
+          type: string
+          example: Warm custard tart
         price_cents:
           type: integer
           minimum: 0
@@ -426,6 +433,7 @@ components:
       type: object
       required:
         - name
+        - description
         - unit_price_cents
         - quantity
         - subtotal_cents
@@ -439,6 +447,9 @@ components:
         name:
           type: string
           example: Dumplings
+        description:
+          type: string
+          example: Pork dumplings
         unit_price_cents:
           type: integer
           minimum: 0
