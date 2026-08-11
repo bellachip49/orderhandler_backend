@@ -1,5 +1,16 @@
 # Version Log
 
+## v1.1
+
+Extended the backend API to own sales-summary rendering and printing while keeping the frontend as a thin client for summary retrieval and print requests.
+
+- Added `GET /api/v1/order-summary` to report the current sales summary, including per-item quantity and revenue breakdowns derived from historical `order_items` snapshots.
+- Added `POST /api/v1/order-summary/print` so the backend can print the cashier sales summary itself, using the configured cashier printer and returning success or failure to the caller.
+- Updated the summary aggregation to count only currently active sale items, so disabled items are excluded from total earned, order count, and printed sales summary output.
+- Added backend receipt rendering for sales summaries with title, timestamp, order count, total earned, and item breakdown lines, reusing the backend printer encoding support.
+- Extended printer dispatch so the backend printer service can print both order tickets and sales-summary tickets over the same TCP path and error handling.
+- Updated the OpenAPI document and backend tests to cover the new summary print endpoint, filtered summary behavior, printer validation, and printer failure responses.
+
 ## v1
 
 Completed the backend API refactor for the cashier ordering workflow, making the backend the system of record for catalog, orders, printer configuration, persistence, authentication, API documentation, and receipt printing.

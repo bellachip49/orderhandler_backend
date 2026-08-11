@@ -57,6 +57,7 @@ HOST=127.0.0.1 go run .
 - `PUT /api/v1/printers/{cashier|kitchen}` saves `host`, `port`, and `enabled`.
 - `GET /api/v1/orders` lists saved orders with item snapshots and print jobs.
 - `GET /api/v1/orders/{id}` loads one saved order.
+- `GET /api/v1/order-summary` returns recorded order count and total earned cents.
 - `POST /api/v1/orders` accepts sale item IDs and quantities, saves the order, assigns a readable `order_number`, creates cashier and kitchen print jobs, and returns the saved order with HTTP 201.
 - Legacy `GET /orders` and `POST /orders` remain temporarily available for older clients.
 
@@ -290,6 +291,12 @@ Load one order, replacing `1` with the order ID:
 
 ```sh
 curl --user "$AUTH" "$BASE_URL/api/v1/orders/1"
+```
+
+Load total earned across all recorded orders:
+
+```sh
+curl --user "$AUTH" "$BASE_URL/api/v1/order-summary"
 ```
 
 Temporary legacy order endpoint for older clients:

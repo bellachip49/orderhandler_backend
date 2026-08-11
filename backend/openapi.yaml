@@ -139,6 +139,36 @@ paths:
                 $ref: "#/components/schemas/Printer"
         "400":
           $ref: "#/components/responses/BadRequest"
+  /api/v1/order-summary:
+    get:
+      summary: Load order revenue summary
+      description: Returns the count of orders with currently active sold items, total earned amount from those active items in cents, and active-item breakdown.
+      responses:
+        "200":
+          description: Order revenue summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderSummary"
+  /api/v1/order-summary/print:
+    post:
+      summary: Print order revenue summary
+      description: Sends the current active-item sales summary to the configured cashier printer and waits for the print attempt result.
+      responses:
+        "200":
+          description: Sales summary sent to cashier printer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PrintOrderSummaryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          description: Printer command failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /api/v1/orders:
     get:
       summary: List orders
@@ -429,6 +459,63 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PrintJob"
+    OrderSummary:
+      type: object
+      required:
+        - order_count
+        - total_cents
+        - items
+      properties:
+        order_count:
+          type: integer
+          minimum: 0
+          description: Number of orders that include at least one currently active sold item.
+          example: 12
+        total_cents:
+          type: integer
+          minimum: 0
+          description: Total cents from sold items whose linked sale item is currently active.
+          example: 84500
+        items:
+          type: array
+          description: Per-item breakdown for sold items whose linked sale item is currently active.
+          items:
+            $ref: "#/components/schemas/OrderSummaryItem"
+    OrderSummaryItem:
+      type: object
+      required:
+        - name
+        - description
+        - quantity_sold
+        - total_cents
+      properties:
+        name:
+          type: string
+          example: Dumplings
+        description:
+          type: string
+          example: Pork dumplings
+        quantity_sold:
+          type: integer
+          minimum: 0
+          example: 14
+        total_cents:
+          type: integer
+          minimum: 0
+          example: 8400
+    PrintOrderSummaryResponse:
+      type: object
+      required:
+        - printer_role
+        - summary
+      properties:
+        printer_role:
+          type: string
+          enum:
+            - cashier
+          example: cashier
+        summary:
+          $ref: "#/components/schemas/OrderSummary"
     OrderItem:
       type: object
       required:

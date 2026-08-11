@@ -21,11 +21,26 @@ import (
 )
 
 type fakePrinterService struct {
-	printed []string
+	printed          []string
+	printedSummaries []string
+	summaryPayloads  [][]byte
+	err              error
 }
 
 func (f *fakePrinterService) Print(printer Printer, order Order) error {
+	if f.err != nil {
+		return f.err
+	}
 	f.printed = append(f.printed, printer.Role+"-"+order.OrderNumber)
+	return nil
+}
+
+func (f *fakePrinterService) PrintSummary(printer Printer, summary OrderSummary) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.printedSummaries = append(f.printedSummaries, printer.Role)
+	f.summaryPayloads = append(f.summaryPayloads, salesSummaryTicket(summary, time.Date(2026, 7, 29, 16, 37, 0, 0, time.UTC)))
 	return nil
 }
 
@@ -338,6 +353,348 @@ func TestCreateOrderUsesCatalogSnapshotAndCreatesPrintJobs(t *testing.T) {
 	}
 }
 
+func TestOrderSummaryReturnsZeroWhenNoOrdersExist(t *testing.T) {
+	_, handler := newTestApp(t)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, authedRequest(http.MethodGet, "/api/v1/order-summary", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	var summary OrderSummary
+	if err := json.NewDecoder(response.Body).Decode(&summary); err != nil {
+		t.Fatalf("decode order summary: %v", err)
+	}
+	if summary.OrderCount != 0 || summary.TotalCents != 0 {
+		t.Fatalf("summary = %+v, want zero orders and zero cents", summary)
+	}
+	if len(summary.Items) != 0 {
+		t.Fatalf("summary items = %+v, want empty items", summary.Items)
+	}
+}
+
+func TestOrderSummaryReturnsPerItemBreakdownForRecordedOrders(t *testing.T) {
+	application, handler := newTestApp(t)
+	items, err := application.store.listSaleItems(true)
+	if err != nil {
+		t.Fatalf("list sale items: %v", err)
+	}
+
+	createOrder := func(body string) {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, authedRequest(http.MethodPost, "/api/v1/orders", bytes.NewReader([]byte(body))))
+		if response.Code != http.StatusCreated {
+			t.Fatalf("create order status = %d, want %d; body: %s", response.Code, http.StatusCreated, response.Body.String())
+		}
+	}
+
+	createOrder(`{"items":[{"sale_item_id":` + jsonNumber(items[0].ID) + `,"quantity":2},{"sale_item_id":` + jsonNumber(items[1].ID) + `,"quantity":1}]}`)
+	createOrder(`{"items":[{"sale_item_id":` + jsonNumber(items[0].ID) + `,"quantity":3},{"sale_item_id":` + jsonNumber(items[2].ID) + `,"quantity":3}]}`)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authedRequest(http.MethodGet, "/api/v1/order-summary", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	var summary OrderSummary
+	if err := json.NewDecoder(response.Body).Decode(&summary); err != nil {
+		t.Fatalf("decode order summary: %v", err)
+	}
+	wantTotal := (items[0].PriceCents * 5) + items[1].PriceCents + (items[2].PriceCents * 3)
+	if summary.OrderCount != 2 || summary.TotalCents != wantTotal {
+		t.Fatalf("summary = %+v, want 2 orders and %d cents", summary, wantTotal)
+	}
+
+	wantItems := []OrderSummaryItem{
+		{
+			Name:         items[0].Name,
+			Description:  items[0].Description,
+			QuantitySold: 5,
+			TotalCents:   items[0].PriceCents * 5,
+		},
+		{
+			Name:         items[2].Name,
+			Description:  items[2].Description,
+			QuantitySold: 3,
+			TotalCents:   items[2].PriceCents * 3,
+		},
+		{
+			Name:         items[1].Name,
+			Description:  items[1].Description,
+			QuantitySold: 1,
+			TotalCents:   items[1].PriceCents,
+		},
+	}
+	if len(summary.Items) != len(wantItems) {
+		t.Fatalf("summary items = %+v, want %+v", summary.Items, wantItems)
+	}
+	for index, wantItem := range wantItems {
+		if summary.Items[index] != wantItem {
+			t.Fatalf("summary item %d = %+v, want %+v", index, summary.Items[index], wantItem)
+		}
+	}
+}
+
+func TestOrderSummaryExcludesDisabledSaleItems(t *testing.T) {
+	application, handler := newTestApp(t)
+	items, err := application.store.listSaleItems(true)
+	if err != nil {
+		t.Fatalf("list sale items: %v", err)
+	}
+	enabledItem := items[0]
+	disabledItem := items[1]
+	disabledOnlyItem := items[2]
+
+	createOrder := func(body string) {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, authedRequest(http.MethodPost, "/api/v1/orders", bytes.NewReader([]byte(body))))
+		if response.Code != http.StatusCreated {
+			t.Fatalf("create order status = %d, want %d; body: %s", response.Code, http.StatusCreated, response.Body.String())
+		}
+	}
+
+	createOrder(`{"items":[{"sale_item_id":` + jsonNumber(enabledItem.ID) + `,"quantity":2},{"sale_item_id":` + jsonNumber(disabledItem.ID) + `,"quantity":3}]}`)
+	createOrder(`{"items":[{"sale_item_id":` + jsonNumber(disabledOnlyItem.ID) + `,"quantity":4}]}`)
+
+	if err := application.store.setSaleItemActive(disabledItem.ID, false); err != nil {
+		t.Fatalf("disable mixed item: %v", err)
+	}
+	if err := application.store.setSaleItemActive(disabledOnlyItem.ID, false); err != nil {
+		t.Fatalf("disable disabled-only item: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authedRequest(http.MethodGet, "/api/v1/order-summary", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, want %d", response.Code, http.StatusOK)
+	}
+
+	var summary OrderSummary
+	if err := json.NewDecoder(response.Body).Decode(&summary); err != nil {
+		t.Fatalf("decode order summary: %v", err)
+	}
+	wantTotal := enabledItem.PriceCents * 2
+	if summary.OrderCount != 1 || summary.TotalCents != wantTotal {
+		t.Fatalf("summary = %+v, want 1 eligible order and %d cents", summary, wantTotal)
+	}
+	wantItems := []OrderSummaryItem{
+		{
+			Name:         enabledItem.Name,
+			Description:  enabledItem.Description,
+			QuantitySold: 2,
+			TotalCents:   wantTotal,
+		},
+	}
+	if len(summary.Items) != len(wantItems) {
+		t.Fatalf("summary items = %+v, want %+v", summary.Items, wantItems)
+	}
+	for index, wantItem := range wantItems {
+		if summary.Items[index] != wantItem {
+			t.Fatalf("summary item %d = %+v, want %+v", index, summary.Items[index], wantItem)
+		}
+	}
+}
+
+func TestOrderSummaryUsesOrderItemSnapshotsAfterCatalogRename(t *testing.T) {
+	application, handler := newTestApp(t)
+	items, err := application.store.listSaleItems(true)
+	if err != nil {
+		t.Fatalf("list sale items: %v", err)
+	}
+
+	orderedItem := items[0]
+	body := []byte(`{"items":[{"sale_item_id":` + jsonNumber(orderedItem.ID) + `,"quantity":2}]}`)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, authedRequest(http.MethodPost, "/api/v1/orders", bytes.NewReader(body)))
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create order status = %d, want %d; body: %s", createResponse.Code, http.StatusCreated, createResponse.Body.String())
+	}
+
+	renamedPayload := []byte(`{"name":"Renamed Item","description":"Changed later","price_cents":999,"active":true}`)
+	updateResponse := httptest.NewRecorder()
+	handler.ServeHTTP(updateResponse, authedRequest(http.MethodPut, "/api/v1/sale-items/"+jsonNumber(orderedItem.ID), bytes.NewReader(renamedPayload)))
+	if updateResponse.Code != http.StatusOK {
+		t.Fatalf("update sale item status = %d, want %d; body: %s", updateResponse.Code, http.StatusOK, updateResponse.Body.String())
+	}
+
+	summaryResponse := httptest.NewRecorder()
+	handler.ServeHTTP(summaryResponse, authedRequest(http.MethodGet, "/api/v1/order-summary", nil))
+	if summaryResponse.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, want %d", summaryResponse.Code, http.StatusOK)
+	}
+
+	var summary OrderSummary
+	if err := json.NewDecoder(summaryResponse.Body).Decode(&summary); err != nil {
+		t.Fatalf("decode order summary: %v", err)
+	}
+	if len(summary.Items) != 1 {
+		t.Fatalf("summary items = %+v, want exactly 1 item", summary.Items)
+	}
+	if summary.Items[0].Name != orderedItem.Name || summary.Items[0].Description != orderedItem.Description {
+		t.Fatalf("summary item = %+v, want original snapshot %q / %q", summary.Items[0], orderedItem.Name, orderedItem.Description)
+	}
+}
+
+func TestOrderSummarySortsByQuantityThenName(t *testing.T) {
+	application, handler := newTestApp(t)
+	alpha, err := application.store.createSaleItem(SaleItem{Name: "Alpha", Description: "Alpha desc", PriceCents: 100, Active: true})
+	if err != nil {
+		t.Fatalf("create alpha: %v", err)
+	}
+	beta, err := application.store.createSaleItem(SaleItem{Name: "Beta", Description: "Beta desc", PriceCents: 200, Active: true})
+	if err != nil {
+		t.Fatalf("create beta: %v", err)
+	}
+	gamma, err := application.store.createSaleItem(SaleItem{Name: "Gamma", Description: "Gamma desc", PriceCents: 300, Active: true})
+	if err != nil {
+		t.Fatalf("create gamma: %v", err)
+	}
+
+	body := []byte(`{"items":[{"sale_item_id":` + jsonNumber(beta.ID) + `,"quantity":2},{"sale_item_id":` + jsonNumber(alpha.ID) + `,"quantity":2},{"sale_item_id":` + jsonNumber(gamma.ID) + `,"quantity":1}]}`)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, authedRequest(http.MethodPost, "/api/v1/orders", bytes.NewReader(body)))
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create order status = %d, want %d; body: %s", createResponse.Code, http.StatusCreated, createResponse.Body.String())
+	}
+
+	summaryResponse := httptest.NewRecorder()
+	handler.ServeHTTP(summaryResponse, authedRequest(http.MethodGet, "/api/v1/order-summary", nil))
+	if summaryResponse.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, want %d", summaryResponse.Code, http.StatusOK)
+	}
+
+	var summary OrderSummary
+	if err := json.NewDecoder(summaryResponse.Body).Decode(&summary); err != nil {
+		t.Fatalf("decode order summary: %v", err)
+	}
+	if len(summary.Items) != 3 {
+		t.Fatalf("summary items = %+v, want 3 items", summary.Items)
+	}
+	if summary.Items[0].Name != "Alpha" || summary.Items[1].Name != "Beta" || summary.Items[2].Name != "Gamma" {
+		t.Fatalf("summary items = %+v, want Alpha, Beta, Gamma order", summary.Items)
+	}
+}
+
+func TestOrderSummaryRequiresBasicAuth(t *testing.T) {
+	_, handler := newTestApp(t)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/order-summary", nil))
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestPrintOrderSummaryRequiresBasicAuth(t *testing.T) {
+	_, handler := newTestApp(t)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/order-summary/print", nil))
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestPrintOrderSummaryReturnsBadRequestWhenCashierPrinterDisabled(t *testing.T) {
+	_, handler := newTestApp(t)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, authedRequest(http.MethodPost, "/api/v1/order-summary/print", nil))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+}
+
+func TestPrintOrderSummaryReturnsBadRequestWhenCashierPrinterMissingHost(t *testing.T) {
+	application, handler := newTestApp(t)
+	if _, err := application.store.updatePrinter(Printer{Role: "cashier", DisplayName: "Cashier Printer", Port: 9100, Enabled: true}); err != nil {
+		t.Fatalf("update printer: %v", err)
+	}
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, authedRequest(http.MethodPost, "/api/v1/order-summary/print", nil))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+}
+
+func TestPrintOrderSummarySendsCashierSummaryReceipt(t *testing.T) {
+	application, handler := newTestApp(t)
+	fakePrinter := application.printer.(*fakePrinterService)
+	if _, err := application.store.updatePrinter(Printer{Role: "cashier", DisplayName: "Cashier Printer", Host: "192.168.1.50", Port: 9100, Enabled: true}); err != nil {
+		t.Fatalf("update printer: %v", err)
+	}
+	items, err := application.store.listSaleItems(true)
+	if err != nil {
+		t.Fatalf("list sale items: %v", err)
+	}
+	body := []byte(`{"items":[{"sale_item_id":` + jsonNumber(items[0].ID) + `,"quantity":2},{"sale_item_id":` + jsonNumber(items[1].ID) + `,"quantity":3}]}`)
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, authedRequest(http.MethodPost, "/api/v1/orders", bytes.NewReader(body)))
+	if createResponse.Code != http.StatusCreated {
+		t.Fatalf("create order status = %d, want %d; body: %s", createResponse.Code, http.StatusCreated, createResponse.Body.String())
+	}
+	if err := application.store.setSaleItemActive(items[1].ID, false); err != nil {
+		t.Fatalf("disable sale item: %v", err)
+	}
+	fakePrinter.printedSummaries = nil
+	fakePrinter.summaryPayloads = nil
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, authedRequest(http.MethodPost, "/api/v1/order-summary/print", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var printed PrintOrderSummaryResponse
+	if err := json.NewDecoder(response.Body).Decode(&printed); err != nil {
+		t.Fatalf("decode print summary response: %v", err)
+	}
+	if printed.PrinterRole != "cashier" || printed.Summary.OrderCount != 1 {
+		t.Fatalf("printed response = %+v, want cashier and 1 order", printed)
+	}
+	if printed.Summary.TotalCents != items[0].PriceCents*2 || len(printed.Summary.Items) != 1 || printed.Summary.Items[0].Name != items[0].Name {
+		t.Fatalf("printed summary = %+v, want enabled item only", printed.Summary)
+	}
+	if len(fakePrinter.printedSummaries) != 1 || fakePrinter.printedSummaries[0] != "cashier" {
+		t.Fatalf("printed summaries = %+v, want one cashier print", fakePrinter.printedSummaries)
+	}
+	if len(fakePrinter.summaryPayloads) != 1 {
+		t.Fatalf("summary payload count = %d, want 1", len(fakePrinter.summaryPayloads))
+	}
+	payloadText := string(fakePrinter.summaryPayloads[0])
+	if !strings.Contains(payloadText, "Sales Summary") ||
+		!strings.Contains(payloadText, "Orders: 1") ||
+		!strings.Contains(payloadText, totalLine(items[0].PriceCents*2)) ||
+		!strings.Contains(payloadText, "x2 "+items[0].Name) {
+		t.Fatalf("summary payload = %q, want title, orders, total, and item breakdown", payloadText)
+	}
+	if strings.Contains(payloadText, items[1].Name) {
+		t.Fatalf("summary payload = %q, want disabled item excluded", payloadText)
+	}
+}
+
+func TestPrintOrderSummaryReturnsBadGatewayWhenPrinterFails(t *testing.T) {
+	application, handler := newTestApp(t)
+	application.printer.(*fakePrinterService).err = errors.New("printer offline")
+	if _, err := application.store.updatePrinter(Printer{Role: "cashier", DisplayName: "Cashier Printer", Host: "192.168.1.50", Port: 9100, Enabled: true}); err != nil {
+		t.Fatalf("update printer: %v", err)
+	}
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, authedRequest(http.MethodPost, "/api/v1/order-summary/print", nil))
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body: %s", response.Code, http.StatusBadGateway, response.Body.String())
+	}
+}
+
 func TestDeactivatingSaleItemKeepsOldOrderSnapshotsReadable(t *testing.T) {
 	application, handler := newTestApp(t)
 	items, err := application.store.listSaleItems(true)
@@ -455,11 +812,17 @@ func TestCashierTicketMatchesCommittedReceiptInstructions(t *testing.T) {
 	ticket := cashierTicket(order)
 	text := string(ticket)
 
+	if receiptTextSizeBody != 0x01 {
+		t.Fatalf("receiptTextSizeBody = %#x, want thin double-height size 0x01", receiptTextSizeBody)
+	}
 	if got := []byte(ticket[:2]); !bytes.Equal(got, []byte{0x1B, 0x40}) {
 		t.Fatalf("ticket prefix = %v, want ESC @", got)
 	}
 	if got := []byte(ticket[2:5]); !bytes.Equal(got, []byte{0x1B, 0x61, 0x00}) {
 		t.Fatalf("alignment command = %v, want left align", got)
+	}
+	if got := []byte(ticket[5:8]); !bytes.Equal(got, []byte{0x1D, 0x21, receiptTextSizeBody}) {
+		t.Fatalf("cashier text size command = %v, want body text size", got)
 	}
 	if bytes.Contains(ticket, []byte{0x1C, 0x26}) {
 		t.Fatalf("cashier ticket contains GBK Chinese mode command in UTF-8 mode: %v", ticket)
@@ -479,8 +842,11 @@ func TestCashierTicketMatchesCommittedReceiptInstructions(t *testing.T) {
 			t.Fatalf("cashier ticket missing %q in %q", want, text)
 		}
 	}
-	if got := []byte(ticket[len(ticket)-9 : len(ticket)-3]); !bytes.Equal(got, []byte{'\n', '\n', '\n', '\n', '\n', '\n'}) {
+	if got := []byte(ticket[len(ticket)-12 : len(ticket)-6]); !bytes.Equal(got, []byte{'\n', '\n', '\n', '\n', '\n', '\n'}) {
 		t.Fatalf("feed bytes = %v, want six newlines", got)
+	}
+	if got := []byte(ticket[len(ticket)-6 : len(ticket)-3]); !bytes.Equal(got, []byte{0x1D, 0x21, receiptTextSizeNormal}) {
+		t.Fatalf("cashier text size reset command = %v, want normal text", got)
 	}
 	if bytes.Contains(ticket, []byte{0x1C, 0x2E}) {
 		t.Fatalf("cashier ticket contains cancel Chinese mode command in UTF-8 mode: %v", ticket)
@@ -515,8 +881,14 @@ func TestKitchenTicketIsFoodOnlyWithOrderNumber(t *testing.T) {
 	if bytes.Contains(ticket, []byte{0x1C, 0x26}) {
 		t.Fatalf("kitchen ticket contains GBK Chinese mode command in UTF-8 mode: %v", ticket)
 	}
-	if got := []byte(ticket[5:8]); !bytes.Equal(got, []byte{0x1D, 0x21, 0x11}) {
-		t.Fatalf("kitchen order number size command = %v, want double size", got)
+	if got := []byte(ticket[5:8]); !bytes.Equal(got, []byte{0x1D, 0x21, receiptTextSizeBody}) {
+		t.Fatalf("kitchen order number size command = %v, want body text size", got)
+	}
+	if !bytes.Contains(ticket, []byte{0x1D, 0x21, receiptTextSizeBody}) {
+		t.Fatalf("kitchen ticket missing body text size command: %v", ticket)
+	}
+	if got := []byte(ticket[len(ticket)-6 : len(ticket)-3]); !bytes.Equal(got, []byte{0x1D, 0x21, receiptTextSizeNormal}) {
+		t.Fatalf("kitchen text size reset command = %v, want normal text", got)
 	}
 	if bytes.Contains(ticket, []byte{0x1C, 0x2E}) {
 		t.Fatalf("kitchen ticket contains cancel Chinese mode command in UTF-8 mode: %v", ticket)

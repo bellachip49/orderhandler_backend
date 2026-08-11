@@ -396,6 +396,10 @@ func newHandler(application *app) http.Handler {
 			printersHandler(w, r, application.store)
 		case strings.HasPrefix(r.URL.Path, "/api/v1/printers/"):
 			printerHandler(w, r, application.store)
+		case r.URL.Path == "/api/v1/order-summary/print":
+			orderSummaryPrintHandler(w, r, application)
+		case r.URL.Path == "/api/v1/order-summary":
+			orderSummaryHandler(w, r, application.store)
 		case r.URL.Path == "/api/v1/orders":
 			ordersHandler(w, r, application)
 		case strings.HasPrefix(r.URL.Path, "/api/v1/orders/"):
@@ -621,6 +625,62 @@ func orderHandler(w http.ResponseWriter, r *http.Request, store *store) {
 	writeJSON(w, http.StatusOK, order)
 }
 
+func orderSummaryHandler(w http.ResponseWriter, r *http.Request, store *store) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	summary, err := store.getOrderSummary()
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
+}
+
+func orderSummaryPrintHandler(w http.ResponseWriter, r *http.Request, application *app) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+
+	summary, err := application.store.getOrderSummary()
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	printer, err := application.store.getPrinter("cashier")
+	if errors.Is(err, errNotFound) {
+		badRequest(w, "cashier printer is not configured")
+		return
+	}
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if !printer.Enabled {
+		badRequest(w, "cashier printer is disabled")
+		return
+	}
+	if strings.TrimSpace(printer.Host) == "" {
+		badRequest(w, "cashier printer is not configured")
+		return
+	}
+	if printer.Port < 1 || printer.Port > 65535 {
+		badRequest(w, "cashier printer port must be between 1 and 65535")
+		return
+	}
+
+	if err := application.printer.PrintSummary(printer, summary); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, PrintOrderSummaryResponse{
+		PrinterRole: printer.Role,
+		Summary:     summary,
+	})
+}
+
 func legacyOrdersHandler(w http.ResponseWriter, r *http.Request, store *store) {
 	switch r.Method {
 	case http.MethodGet:
@@ -735,6 +795,24 @@ type Order struct {
 	Items       []OrderItem `json:"items"`
 	TotalCents  int         `json:"total_cents"`
 	PrintJobs   []PrintJob  `json:"print_jobs,omitempty"`
+}
+
+type OrderSummary struct {
+	OrderCount int                `json:"order_count"`
+	TotalCents int                `json:"total_cents"`
+	Items      []OrderSummaryItem `json:"items"`
+}
+
+type OrderSummaryItem struct {
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	QuantitySold int    `json:"quantity_sold"`
+	TotalCents   int    `json:"total_cents"`
+}
+
+type PrintOrderSummaryResponse struct {
+	PrinterRole string       `json:"printer_role"`
+	Summary     OrderSummary `json:"summary"`
 }
 
 type OrderItem struct {
@@ -1178,6 +1256,52 @@ func (s *store) listOrders() ([]Order, error) {
 	return orders, rows.Err()
 }
 
+func (s *store) getOrderSummary() (OrderSummary, error) {
+	summary := OrderSummary{Items: []OrderSummaryItem{}}
+	err := s.db.QueryRow(`
+		SELECT
+			COUNT(DISTINCT order_items.order_id),
+			COALESCE(SUM(order_items.subtotal_cents), 0)
+		FROM order_items
+		JOIN sale_items ON sale_items.id = order_items.sale_item_id
+		WHERE sale_items.active = 1
+	`).
+		Scan(&summary.OrderCount, &summary.TotalCents)
+	if err != nil {
+		return OrderSummary{}, err
+	}
+
+	rows, err := s.db.Query(`
+		SELECT
+			order_items.name,
+			order_items.description,
+			COALESCE(SUM(order_items.quantity), 0) AS quantity_sold,
+			COALESCE(SUM(order_items.subtotal_cents), 0) AS total_cents
+		FROM order_items
+		JOIN sale_items ON sale_items.id = order_items.sale_item_id
+		WHERE sale_items.active = 1
+		GROUP BY order_items.name, order_items.description
+		ORDER BY quantity_sold DESC, order_items.name COLLATE NOCASE ASC, order_items.description COLLATE NOCASE ASC
+	`)
+	if err != nil {
+		return OrderSummary{}, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item OrderSummaryItem
+		if err := rows.Scan(&item.Name, &item.Description, &item.QuantitySold, &item.TotalCents); err != nil {
+			return OrderSummary{}, err
+		}
+		summary.Items = append(summary.Items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return OrderSummary{}, err
+	}
+
+	return summary, nil
+}
+
 func (s *store) getOrder(id int64) (Order, error) {
 	var order Order
 	err := s.db.QueryRow(`SELECT id, order_number, created_at, total_cents FROM orders WHERE id = ?`, id).
@@ -1246,6 +1370,7 @@ func (s *store) updatePrintJob(id int64, status string, lastError string) error 
 
 type PrinterService interface {
 	Print(printer Printer, order Order) error
+	PrintSummary(printer Printer, summary OrderSummary) error
 }
 
 type TCPPrinterService struct {
@@ -1255,6 +1380,14 @@ type TCPPrinterService struct {
 }
 
 func (s TCPPrinterService) Print(printer Printer, order Order) error {
+	return s.printPayload(printer, renderTicketWithEncoding(printer.Role, order, s.textEncoding()))
+}
+
+func (s TCPPrinterService) PrintSummary(printer Printer, summary OrderSummary) error {
+	return s.printPayload(printer, salesSummaryTicketWithEncoding(summary, time.Now(), s.textEncoding()))
+}
+
+func (s TCPPrinterService) printPayload(printer Printer, payload []byte) error {
 	timeout := s.Timeout
 	if timeout == 0 {
 		timeout = 8 * time.Second
@@ -1274,7 +1407,6 @@ func (s TCPPrinterService) Print(printer Printer, order Order) error {
 	if err := connection.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
-	payload := renderTicketWithEncoding(printer.Role, order, s.textEncoding())
 	written, err := connection.Write(payload)
 	if err != nil {
 		return err
@@ -1305,6 +1437,11 @@ func renderTicketWithEncoding(role string, order Order, encoding printerTextEnco
 
 const receiptWidth = 30
 
+const (
+	receiptTextSizeNormal = 0x00
+	receiptTextSizeBody   = 0x01
+)
+
 func cashierTicket(order Order) []byte {
 	return cashierTicketWithEncoding(order, defaultPrinterTextEncoding)
 }
@@ -1314,9 +1451,11 @@ func cashierTicketWithEncoding(order Order, encoding printerTextEncoding) []byte
 	buffer.command(0x1B, 0x40)
 	buffer.command(0x1B, 0x61, 0x00)
 	buffer.startText()
+	buffer.textSize(receiptTextSizeBody)
 	buffer.text("Order #")
 	buffer.text(order.OrderNumber)
 	buffer.text("\n")
+	buffer.textSize(receiptTextSizeBody)
 	buffer.text(divider(receiptWidth))
 	buffer.text("\n")
 	buffer.text(formatReceiptDate(order.CreatedAt))
@@ -1328,6 +1467,7 @@ func cashierTicketWithEncoding(order Order, encoding printerTextEncoding) []byte
 			buffer.text(description)
 			buffer.text("\n")
 		}
+		buffer.text("\n") // Add an extra newline after each item for spacing
 	}
 	buffer.text("\n")
 	buffer.text(divider(receiptWidth))
@@ -1337,6 +1477,7 @@ func cashierTicketWithEncoding(order Order, encoding printerTextEncoding) []byte
 	buffer.text("Thank you!\n")
 	buffer.text(divider(receiptWidth))
 	buffer.text("\n\n\n\n\n\n")
+	buffer.textSize(receiptTextSizeNormal)
 	buffer.endText()
 	buffer.command(0x1D, 0x56, 0x00)
 	return buffer.bytes()
@@ -1351,13 +1492,13 @@ func kitchenTicketWithEncoding(order Order, encoding printerTextEncoding) []byte
 	buffer.command(0x1B, 0x40)
 	buffer.command(0x1B, 0x61, 0x00)
 	buffer.startText()
-	buffer.command(0x1D, 0x21, 0x11)
+	buffer.textSize(receiptTextSizeBody)
 	buffer.command(0x1B, 0x45, 0x01)
 	buffer.text("Order #")
 	buffer.text(order.OrderNumber)
 	buffer.text("\n")
 	buffer.command(0x1B, 0x45, 0x00)
-	buffer.command(0x1D, 0x21, 0x00)
+	buffer.textSize(receiptTextSizeBody)
 	buffer.text(divider(receiptWidth))
 	buffer.text("\n")
 	buffer.text(formatReceiptDate(order.CreatedAt))
@@ -1369,9 +1510,55 @@ func kitchenTicketWithEncoding(order Order, encoding printerTextEncoding) []byte
 			buffer.text(description)
 			buffer.text("\n")
 		}
+		buffer.text("\n") // Add an extra newline after each item for spacing
 	}
 	buffer.text(divider(receiptWidth))
 	buffer.text("\n\n\n\n\n\n")
+	buffer.textSize(receiptTextSizeNormal)
+	buffer.endText()
+	buffer.command(0x1D, 0x56, 0x00)
+	return buffer.bytes()
+}
+
+func salesSummaryTicket(summary OrderSummary, printedAt time.Time) []byte {
+	return salesSummaryTicketWithEncoding(summary, printedAt, defaultPrinterTextEncoding)
+}
+
+func salesSummaryTicketWithEncoding(summary OrderSummary, printedAt time.Time, encoding printerTextEncoding) []byte {
+	buffer := newReceiptBuffer(encoding)
+	buffer.command(0x1B, 0x40)
+	buffer.command(0x1B, 0x61, 0x00)
+	buffer.startText()
+	buffer.textSize(receiptTextSizeBody)
+	buffer.command(0x1B, 0x45, 0x01)
+	buffer.text("Sales Summary\n")
+	buffer.command(0x1B, 0x45, 0x00)
+	buffer.textSize(receiptTextSizeBody)
+	buffer.text(divider(receiptWidth))
+	buffer.text("\n")
+	buffer.text(printedAt.In(pacificLocation).Format("01/02/06  3:04 PM"))
+	buffer.text("\n\n")
+	buffer.text("Orders: ")
+	buffer.text(strconv.Itoa(summary.OrderCount))
+	buffer.text("\n\n")
+	for _, item := range summary.Items {
+		buffer.text(salesSummaryItemLine(item))
+		buffer.text("\n")
+		if description := descriptionLine(item.Description); description != "" {
+			buffer.text(description)
+			buffer.text("\n")
+		}
+		buffer.text("\n")
+	}
+	if len(summary.Items) > 0 {
+		buffer.text("\n")
+	}
+	buffer.text(totalLine(summary.TotalCents))
+	buffer.text("\n\n")
+	buffer.text("Printed from CashierDesk\n")
+	buffer.text(divider(receiptWidth))
+	buffer.text("\n\n\n\n\n\n")
+	buffer.textSize(receiptTextSizeNormal)
 	buffer.endText()
 	buffer.command(0x1D, 0x56, 0x00)
 	return buffer.bytes()
@@ -1391,6 +1578,10 @@ func newReceiptBuffer(encoding printerTextEncoding) receiptBuffer {
 
 func (b *receiptBuffer) command(values ...byte) {
 	b.buffer.Write(values)
+}
+
+func (b *receiptBuffer) textSize(size byte) {
+	b.command(0x1D, 0x21, size)
 }
 
 func (b *receiptBuffer) startText() {
@@ -1426,6 +1617,15 @@ func kitchenItemLine(item OrderItem) string {
 	prefix := strconv.Itoa(item.Quantity) + "  "
 	nameWidth := max(0, receiptWidth-receiptTextWidth(prefix))
 	return prefix + truncateReceiptText(item.Name, nameWidth)
+}
+
+func salesSummaryItemLine(item OrderSummaryItem) string {
+	prefix := "x" + strconv.Itoa(item.QuantitySold) + " "
+	amount := formatMoney(item.TotalCents)
+	nameWidth := max(0, receiptWidth-receiptTextWidth(prefix)-receiptTextWidth(amount)-1)
+	name := truncateReceiptText(item.Name, nameWidth)
+	spaces := strings.Repeat(" ", max(1, receiptWidth-receiptTextWidth(prefix)-receiptTextWidth(name)-receiptTextWidth(amount)))
+	return prefix + name + spaces + amount
 }
 
 func descriptionLine(description string) string {
