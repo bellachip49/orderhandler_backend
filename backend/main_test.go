@@ -353,6 +353,133 @@ func TestCreateOrderUsesCatalogSnapshotAndCreatesPrintJobs(t *testing.T) {
 	}
 }
 
+func TestOrderHistoryLimitReturnsMostRecentOrders(t *testing.T) {
+	application, handler := newTestApp(t)
+	items, err := application.store.listSaleItems(true)
+	if err != nil {
+		t.Fatalf("list sale items: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		body := []byte(`{"items":[{"sale_item_id":` + jsonNumber(items[i].ID) + `,"quantity":1}]}`)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, authedRequest(http.MethodPost, "/api/v1/orders", bytes.NewReader(body)))
+		if response.Code != http.StatusCreated {
+			t.Fatalf("create order %d status = %d, want %d; body: %s", i, response.Code, http.StatusCreated, response.Body.String())
+		}
+	}
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authedRequest(http.MethodGet, "/api/v1/orders?limit=2", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("history status = %d, want %d; body: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var orders []Order
+	if err := json.NewDecoder(response.Body).Decode(&orders); err != nil {
+		t.Fatalf("decode orders: %v", err)
+	}
+	if len(orders) != 2 {
+		t.Fatalf("orders = %+v, want 2 recent orders", orders)
+	}
+	if orders[0].OrderNumber != "1003" || orders[1].OrderNumber != "1002" {
+		t.Fatalf("order numbers = %q/%q, want 1003/1002", orders[0].OrderNumber, orders[1].OrderNumber)
+	}
+}
+
+func TestOrderHistoryLogsReturnedPayload(t *testing.T) {
+	application, handler := newTestApp(t)
+	items, err := application.store.listSaleItems(true)
+	if err != nil {
+		t.Fatalf("list sale items: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		body := []byte(`{"items":[{"sale_item_id":` + jsonNumber(items[i].ID) + `,"quantity":1}]}`)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, authedRequest(http.MethodPost, "/api/v1/orders", bytes.NewReader(body)))
+		if response.Code != http.StatusCreated {
+			t.Fatalf("create order %d status = %d, want %d; body: %s", i, response.Code, http.StatusCreated, response.Body.String())
+		}
+	}
+
+	var logOutput bytes.Buffer
+	originalOutput := log.Writer()
+	log.SetOutput(&logOutput)
+	t.Cleanup(func() { log.SetOutput(originalOutput) })
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authedRequest(http.MethodGet, "/api/v1/orders?limit=2", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("history status = %d, want %d; body: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var orders []Order
+	if err := json.NewDecoder(response.Body).Decode(&orders); err != nil {
+		t.Fatalf("decode orders: %v", err)
+	}
+	if len(orders) != 2 || orders[0].OrderNumber != "1003" || orders[1].OrderNumber != "1002" {
+		t.Fatalf("orders = %+v, want two newest orders", orders)
+	}
+
+	logText := logOutput.String()
+	for _, expected := range []string{
+		"order history response",
+		"limit=2",
+		"count=2",
+		`"order_number":"1003"`,
+	} {
+		if !strings.Contains(logText, expected) {
+			t.Fatalf("log output = %q, want %q", logText, expected)
+		}
+	}
+}
+
+func TestOrderHistoryLogsEmptyPayload(t *testing.T) {
+	_, handler := newTestApp(t)
+	var logOutput bytes.Buffer
+	originalOutput := log.Writer()
+	log.SetOutput(&logOutput)
+	t.Cleanup(func() { log.SetOutput(originalOutput) })
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, authedRequest(http.MethodGet, "/api/v1/orders", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("history status = %d, want %d; body: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var orders []Order
+	if err := json.NewDecoder(response.Body).Decode(&orders); err != nil {
+		t.Fatalf("decode orders: %v", err)
+	}
+	if len(orders) != 0 {
+		t.Fatalf("orders = %+v, want empty history", orders)
+	}
+
+	logText := logOutput.String()
+	for _, expected := range []string{
+		"order history response",
+		"limit=0",
+		"count=0",
+		"data=[]",
+	} {
+		if !strings.Contains(logText, expected) {
+			t.Fatalf("log output = %q, want %q", logText, expected)
+		}
+	}
+}
+
+func TestOrderHistoryLimitRejectsInvalidLimit(t *testing.T) {
+	_, handler := newTestApp(t)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, authedRequest(http.MethodGet, "/api/v1/orders?limit=500", nil))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("history status = %d, want %d; body: %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+}
+
 func TestOrderSummaryReturnsZeroWhenNoOrdersExist(t *testing.T) {
 	_, handler := newTestApp(t)
 	response := httptest.NewRecorder()

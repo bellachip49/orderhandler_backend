@@ -1,5 +1,15 @@
 # Version Log
 
+## v1.1.0
+
+Added backend support for the frontend Order History window and improved observability for that flow.
+
+- Updated `GET /api/v1/orders` with an optional `limit` query parameter so the iPad can request the most recent orders without loading the full history.
+- Changed order-history listing to return newest limited results first and to load order headers before item and print-job detail queries, avoiding SQLite single-connection stalls during history reads.
+- Added backend server logging for successful order-history responses, including the applied limit, returned count, and compact JSON payload sent to the frontend.
+- Updated `backend/openapi.yaml` to document the order-history limit parameter.
+- Added backend tests for limited newest-first history, invalid limits, logged order-history payloads, and empty history logging.
+
 ## v1.1
 
 Extended the backend API to own sales-summary rendering and printing while keeping the frontend as a thin client for summary retrieval and print requests.

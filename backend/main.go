@@ -577,11 +577,16 @@ func printerHandler(w http.ResponseWriter, r *http.Request, store *store) {
 func ordersHandler(w http.ResponseWriter, r *http.Request, application *app) {
 	switch r.Method {
 	case http.MethodGet:
-		orders, err := application.store.listOrders()
+		limit, ok := parseOptionalLimit(w, r, 200)
+		if !ok {
+			return
+		}
+		orders, err := application.store.listOrders(limit)
 		if err != nil {
 			internalError(w, err)
 			return
 		}
+		logOrderHistoryResponse(limit, orders)
 		writeJSON(w, http.StatusOK, orders)
 	case http.MethodPost:
 		var request createOrderRequest
@@ -684,7 +689,7 @@ func orderSummaryPrintHandler(w http.ResponseWriter, r *http.Request, applicatio
 func legacyOrdersHandler(w http.ResponseWriter, r *http.Request, store *store) {
 	switch r.Method {
 	case http.MethodGet:
-		orders, err := store.listOrders()
+		orders, err := store.listOrders(0)
 		if err != nil {
 			internalError(w, err)
 			return
@@ -1231,29 +1236,47 @@ func (s *store) createOrderFromSnapshot(items []OrderItem, total int) (Order, []
 	return Order{ID: orderID, OrderNumber: orderNumber, CreatedAt: now, Items: items, TotalCents: total, PrintJobs: jobs}, jobs, nil
 }
 
-func (s *store) listOrders() ([]Order, error) {
-	rows, err := s.db.Query(`SELECT id, order_number, created_at, total_cents FROM orders ORDER BY id`)
+func (s *store) listOrders(limit int) ([]Order, error) {
+	query := `SELECT id, order_number, created_at, total_cents FROM orders ORDER BY id`
+	var rows *sql.Rows
+	var err error
+	if limit > 0 {
+		query = `SELECT id, order_number, created_at, total_cents FROM orders ORDER BY id DESC LIMIT ?`
+		rows, err = s.db.Query(query, limit)
+	} else {
+		rows, err = s.db.Query(query)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var orders []Order
 	for rows.Next() {
 		var order Order
 		if err := rows.Scan(&order.ID, &order.OrderNumber, &order.CreatedAt, &order.TotalCents); err != nil {
-			return nil, err
-		}
-		order.Items, err = s.listOrderItems(order.ID)
-		if err != nil {
-			return nil, err
-		}
-		order.PrintJobs, err = s.listPrintJobs(order.ID)
-		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		orders = append(orders, order)
 	}
-	return orders, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	for index := range orders {
+		orders[index].Items, err = s.listOrderItems(orders[index].ID)
+		if err != nil {
+			return nil, err
+		}
+		orders[index].PrintJobs, err = s.listPrintJobs(orders[index].ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return orders, nil
 }
 
 func (s *store) getOrderSummary() (OrderSummary, error) {
@@ -1745,6 +1768,32 @@ func parseIDFromPath(w http.ResponseWriter, path string, prefix string) (int64, 
 		return 0, false
 	}
 	return id, true
+}
+
+func parseOptionalLimit(w http.ResponseWriter, r *http.Request, maxLimit int) (int, bool) {
+	rawLimit := strings.TrimSpace(r.URL.Query().Get("limit"))
+	if rawLimit == "" {
+		return 0, true
+	}
+	limit, err := strconv.Atoi(rawLimit)
+	if err != nil || limit < 1 || limit > maxLimit {
+		badRequest(w, "limit must be a number between 1 and "+strconv.Itoa(maxLimit))
+		return 0, false
+	}
+	return limit, true
+}
+
+func logOrderHistoryResponse(limit int, orders []Order) {
+	loggedOrders := orders
+	if loggedOrders == nil {
+		loggedOrders = []Order{}
+	}
+	payload, err := json.Marshal(loggedOrders)
+	if err != nil {
+		log.Printf("order history response log serialization failed: %v", err)
+		return
+	}
+	log.Printf("order history response limit=%d count=%d data=%s", limit, len(orders), payload)
 }
 
 func badRequest(w http.ResponseWriter, message string) {

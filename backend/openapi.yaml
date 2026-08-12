@@ -172,6 +172,15 @@ paths:
   /api/v1/orders:
     get:
       summary: List orders
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Optional maximum number of most recent orders to return.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
       responses:
         "200":
           description: Orders with item snapshots and print jobs
